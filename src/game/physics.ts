@@ -1,431 +1,487 @@
-import { CIRCUIT, TrackProjection } from './track';
+import { BARRIER_HALF_WIDTH, CircuitTrack, ROAD_HALF_WIDTH } from './track';
+import { CarState, InputState, SimEvent } from './types';
 
-export interface CarSpec {
-  id: number;
-  name: string;
-  shortCode: string;
-  color: string;
-  accent: string;
-  topSpeed: number;     // m/s
-  accel: number;        // m/s^2
-  grip: number;         // lateral damping factor
+export const CAR_LENGTH = 4.3;
+export const CAR_WIDTH = 1.96;
+export const CAR_RADIUS = 1.12;
+export const WHEEL_RADIUS = 0.36;
+export const CIRCLE_OFFSET = 1.05;
+export const CIRCLE_RADIUS = 0.96;
+
+const MAX_FORWARD_SPEED = 70.0; // ~252 km/h
+const NITRO_MAX_SPEED = 84.5; // ~304 km/h
+const MAX_REVERSE_SPEED = 18.0;
+const ENGINE_ACCEL = 34.0;
+const BRAKE_DECEL = 52.0;
+const REVERSE_ACCEL = 22.0;
+const ROLLING_DRAG = 0.22;
+const AERO_DRAG = 0.0046;
+
+export function normalizeAngle(a: number): number {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
 }
 
-export const CAR_SPECS: ReadonlyArray<CarSpec> = [
-  { id: 0, name: 'You (Apex Red)', shortCode: 'YOU', color: '#ef4444', accent: '#ffffff', topSpeed: 69.5, accel: 32.5, grip: 9.8 },
-  { id: 1, name: 'Cobalt RS', shortCode: 'COB', color: '#2563eb', accent: '#bae6fd', topSpeed: 69.0, accel: 31.8, grip: 9.6 },
-  { id: 2, name: 'Solaris GT', shortCode: 'SOL', color: '#f59e0b', accent: '#1e293b', topSpeed: 68.5, accel: 31.6, grip: 9.5 },
-  { id: 3, name: 'Emerald Evo', shortCode: 'EME', color: '#10b981', accent: '#ecfdf5', topSpeed: 68.0, accel: 31.2, grip: 9.6 },
-  { id: 4, name: 'Violet V8', shortCode: 'VIO', color: '#8b5cf6', accent: '#f5f3ff', topSpeed: 67.5, accel: 30.8, grip: 9.4 },
-  { id: 5, name: 'Glacier Spec', shortCode: 'GLA', color: '#06b6d4', accent: '#0f172a', topSpeed: 67.0, accel: 30.5, grip: 9.4 },
-];
-
-export interface ControlInput {
-  throttle: number;   // 0..1
-  brake: number;      // 0..1
-  steer: number;      // -1 (left) .. +1 (right)
-  handbrake: boolean; // Space drift
-}
-
-export interface CarState {
-  id: number;
-  spec: CarSpec;
-  x: number;
-  z: number;
-  vx: number;
-  vz: number;
-  yaw: number;      // radians; 0 = +Z, +PI/2 = +X
-  yawRate: number;
-  steerAngle: number; // visual & physics steer angle (+ = right, - = left)
-  wheelSpin: number;
-  speed: number;      // signed forward speed (m/s)
-  speedKmh: number;
-  throttle: number;
-  braking: boolean;
-  handbrake: boolean;
-  isDrifting: boolean;
-  driftIntensity: number;
-  bodyRoll: number;
-  bodyPitch: number;
-
-  // Track progress & lap timing
-  sampleIndex: number;
-  s: number;
-  lateral: number;
-  lapsCompleted: number;
-  maxLapS: number; // anti-cheat checkpoint progress within current lap
-  passedHalfway: boolean;
-  totalProgress: number;
-  finished: boolean;
-  finishTime: number | null;
-  currentLapStartTime: number;
-  lastLapTime: number | null;
-  bestLapTime: number | null;
-  lapTimes: number[];
-
-  // Collision & stuck telemetry
-  barrierHitCooldown: number;
-  stuckWindowTimer: number;
-  stuckAnchorX: number;
-  stuckAnchorZ: number;
-  maxStationaryDuration: number;
-  hasBeenStuckOver5s: boolean;
-
-  // Hit shake feedback (for player camera)
-  lastImpactIntensity: number;
-}
-
-export function createCarAtGrid(id: number): CarState {
-  const spec = CAR_SPECS[id];
-  // Grid: 2 columns x 3 rows behind start/finish line (s = totalLength - offset)
-  // Row 0 (pole): id 5, 4 or id 1, 2; Player starts P6 (back right) for exciting overtakes,
-  // or P4/P6! Let's put Player at P6 (id 0 at back-right of grid) so overtaking is rewarding,
-  // and grid order 1..6 is [1, 2, 3, 4, 5, 0] -> wait: let's make grid slot = id so P1..P6:
-  // Actually starting player in P6 (slot 5) behind 5 opponents makes the race thrilling!
-  const gridSlot = id === 0 ? 5 : id - 1; // Opponents in slots 0..4, Player in slot 5
-  const row = Math.floor(gridSlot / 2); // 0, 1, 2
-  const col = gridSlot % 2;             // 0 (left), 1 (right)
-  const sBack = 14 + row * 10.5 + col * 3.0;
-  const s = CIRCUIT.wrapS(CIRCUIT.totalLength - sBack);
-  const lat = col === 0 ? -3.4 : 3.4;
-
-  const smp = CIRCUIT.sampleAtS(s);
-  const x = smp.x + smp.rx * lat;
-  const z = smp.z + smp.rz * lat;
-  const yaw = Math.atan2(smp.tx, smp.tz);
-
-  return {
-    id,
-    spec,
-    x,
-    z,
-    vx: 0,
-    vz: 0,
-    yaw,
-    yawRate: 0,
-    steerAngle: 0,
-    wheelSpin: 0,
-    speed: 0,
-    speedKmh: 0,
-    throttle: 0,
-    braking: false,
-    handbrake: false,
-    isDrifting: false,
-    driftIntensity: 0,
-    bodyRoll: 0,
-    bodyPitch: 0,
-
-    sampleIndex: smp.index,
-    s,
-    lateral: lat,
-    lapsCompleted: 0,
-    maxLapS: 0,
-    passedHalfway: false,
-    // Negative initial progress proportional to distance behind start line so starting order P1..P6 is exact
-    totalProgress: -sBack,
-    finished: false,
-    finishTime: null,
-    currentLapStartTime: 0,
-    lastLapTime: null,
-    bestLapTime: null,
-    lapTimes: [],
-
-    barrierHitCooldown: 0,
-    stuckWindowTimer: 0,
-    stuckAnchorX: x,
-    stuckAnchorZ: z,
-    maxStationaryDuration: 0,
-    hasBeenStuckOver5s: false,
-    lastImpactIntensity: 0,
-  };
-}
-
-export function stepCarPhysics(car: CarState, input: ControlInput, dt: number): void {
-  car.lastImpactIntensity = 0;
+export function stepCarPhysics(
+  car: CarState,
+  input: InputState,
+  track: CircuitTrack,
+  dt: number,
+  events: SimEvent[],
+  canMove: boolean
+): { barrierHit: boolean } {
   if (car.barrierHitCooldown > 0) {
     car.barrierHitCooldown = Math.max(0, car.barrierHitCooldown - dt);
   }
-
-  const fx = Math.sin(car.yaw);
-  const fz = Math.cos(car.yaw);
-  const rx = -fz; // right normal perpendicular to (fx, fz)
-  const rz = fx;
-
-  let vFwd = car.vx * fx + car.vz * fz;
-  let vLat = car.vx * rx + car.vz * rz;
-  const absSpeed = Math.hypot(vFwd, vLat);
-
-  // Smooth steering angle
-  const maxSteer = 0.52; // ~30 deg
-  const speedSteerScale = 1.0 - 0.58 * Math.min(1, Math.abs(vFwd) / car.spec.topSpeed);
-  const targetSteer = input.steer * maxSteer * (0.45 + 0.55 * speedSteerScale);
-  const steerRate = 9.5;
-  car.steerAngle += (targetSteer - car.steerAngle) * Math.min(1, steerRate * dt);
-
-  // Determine drift engagement (Space handbrake while moving & turning, or high lateral slip)
-  const wantHandbrake = input.handbrake && Math.abs(vFwd) > 7.5;
-  const isSliding = Math.abs(vLat) > 3.2 || (wantHandbrake && Math.abs(input.steer) > 0.15);
-  car.isDrifting = isSliding && absSpeed > 8.0;
-  const targetDriftInt = car.isDrifting
-    ? Math.min(1, (Math.abs(vLat) / 14) + (wantHandbrake ? 0.35 : 0))
-    : 0;
-  car.driftIntensity += (targetDriftInt - car.driftIntensity) * Math.min(1, 10 * dt);
-
-  // Longitudinal forces: acceleration, braking, reverse, aerodynamic drag
-  car.throttle = input.throttle;
-  car.handbrake = input.handbrake;
-  car.braking = input.brake > 0.1 && vFwd > 1.5;
-
-  let accelFwd = 0;
-  if (input.throttle > 0) {
-    const speedRatio = Math.max(0, vFwd / car.spec.topSpeed);
-    // Strong arcade torque curve
-    const torqueCurve = Math.max(0.18, 1.15 - 0.92 * speedRatio * speedRatio);
-    accelFwd += input.throttle * car.spec.accel * torqueCurve;
+  if (car.carHitCooldown > 0) {
+    car.carHitCooldown = Math.max(0, car.carHitCooldown - dt);
   }
 
-  if (input.brake > 0) {
-    if (vFwd > 1.0) {
-      accelFwd -= input.brake * 38.0; // strong braking
+  // Handle reset onto track
+  if (canMove && input.resetPressed) {
+    const proj = track.project(car.x, car.z, car.trackIdx);
+    car.x = proj.x;
+    car.z = proj.z;
+    car.vx = 0;
+    car.vz = 0;
+    car.angularVel = 0;
+    car.heading = Math.atan2(proj.tz, proj.tx);
+    car.forwardSpeed = 0;
+    car.lateralSpeed = 0;
+    car.isDrifting = false;
+    car.isBoosting = false;
+    car.currentDriftScore = 0;
+    car.driftTime = 0;
+    car.driftCombo = 1;
+    car.driftAngleDeg = 0;
+    car.bodyRoll = 0;
+    car.bodyPitch = 0;
+    car.trackIdx = proj.idx;
+    car.trackS = proj.s;
+    car.trackD = 0;
+    car.isOffTrack = false;
+    car.stuckTimer = 0;
+    return { barrierHit: false };
+  }
+
+  if (!canMove) {
+    const targetSteer = input.steer * 0.42;
+    car.steerAngle += (targetSteer - car.steerAngle) * Math.min(1, 12 * dt);
+    car.vx = 0;
+    car.vz = 0;
+    car.forwardSpeed = 0;
+    car.lateralSpeed = 0;
+    car.isDrifting = false;
+    car.isBoosting = false;
+    car.isBraking = input.brake > 0.1 || input.handbrake;
+    return { barrierHit: false };
+  }
+
+  // Nitro boost state update
+  if (car.nitro >= 15) {
+    car.nitroLockedUntilRecharge = false;
+  }
+  const canNitro = input.nitro && !car.nitroLockedUntilRecharge && car.nitro > 0.5 && input.brake < 0.2;
+  if (canNitro) {
+    if (!car.isBoosting) {
+      car.boostActivations += 1;
+      events.push({ type: 'nitro_start', carIndex: car.index });
+    }
+    car.isBoosting = true;
+    car.nitro = Math.max(0, car.nitro - 26.0 * dt);
+    car.boostSecondsUsed += dt;
+    if (car.nitro <= 0.5) {
+      car.nitro = 0;
+      car.isBoosting = false;
+      car.nitroLockedUntilRecharge = true;
+    }
+  } else {
+    car.isBoosting = false;
+  }
+
+  const fx = Math.cos(car.heading);
+  const fz = Math.sin(car.heading);
+  const rx = -fz;
+  const rz = fx;
+
+  let vLong = car.vx * fx + car.vz * fz;
+  let vLat = car.vx * rx + car.vz * rz;
+  const speedMag = Math.hypot(vLong, vLat);
+
+  const maxSteerVisual = 0.46;
+  const targetSteerAngle = input.steer * maxSteerVisual;
+  car.steerAngle += (targetSteerAngle - car.steerAngle) * Math.min(1, 14 * dt);
+
+  const wantDrift = input.handbrake && vLong > 10.5 && (Math.abs(input.steer) > 0.12 || Math.abs(vLat) > 2.8);
+  car.isDrifting = wantDrift || (Math.abs(vLat) > 5.4 && vLong > 10);
+
+  // Longitudinal forces
+  let accelLong = 0;
+  let braking = false;
+
+  const activeTopSpeed = (car.isBoosting ? NITRO_MAX_SPEED : MAX_FORWARD_SPEED) * car.spec.straightBoost;
+  const effectiveThrottle = car.isBoosting ? Math.max(input.throttle, 1.0) : input.throttle;
+
+  if (effectiveThrottle > 0) {
+    if (vLong < -1.0) {
+      accelLong += BRAKE_DECEL * effectiveThrottle;
+      braking = true;
     } else {
-      // Reverse gear (capped at -18 m/s)
-      if (vFwd > -18.0) {
-        accelFwd -= input.brake * 18.0;
-      }
+      const speedRatio = Math.max(0, vLong / activeTopSpeed);
+      const torqueCurve = 1.15 - 0.55 * speedRatio * speedRatio;
+      const boostMul = car.isBoosting ? 1.48 : 1.0;
+      accelLong += ENGINE_ACCEL * effectiveThrottle * torqueCurve * car.spec.baseSkill * boostMul;
     }
   }
 
-  if (wantHandbrake) {
-    // Handbrake shaves slight forward speed while kicking out the rear
-    accelFwd -= Math.sign(vFwd) * 4.5;
+  if (input.brake > 0) {
+    if (vLong > 1.2) {
+      accelLong -= BRAKE_DECEL * input.brake;
+      braking = true;
+    } else if (vLong > -MAX_REVERSE_SPEED) {
+      accelLong -= REVERSE_ACCEL * input.brake;
+    }
   }
 
-  // Rolling resistance + quadratic aero drag
-  const drag = 0.0048 * vFwd * Math.abs(vFwd) + 0.32 * vFwd;
-  accelFwd -= drag;
-
-  vFwd += accelFwd * dt;
-  // Soft top-speed cap
-  if (vFwd > car.spec.topSpeed) {
-    vFwd += (car.spec.topSpeed - vFwd) * Math.min(1, 6 * dt);
-  }
-  if (vFwd < -18.0) {
-    vFwd = -18.0;
+  if (input.handbrake) {
+    if (vLong > 14 && Math.abs(input.steer) > 0.1) {
+      accelLong -= 7.0;
+    } else if (vLong > 0.5) {
+      accelLong -= 24.0;
+      braking = true;
+    }
   }
 
-  // Steering & yaw dynamics (positive steer = turn right => yaw decreases)
-  const dirSign = vFwd >= -0.4 ? 1 : -1;
-  const lowSpeedFactor = Math.min(1, absSpeed / 5.5);
-  const driftTurnBoost = wantHandbrake ? 1.48 : car.isDrifting ? 1.22 : 1.0;
-  const targetYawRate = -car.steerAngle * 3.15 * lowSpeedFactor * dirSign * driftTurnBoost;
-  const yawResponse = wantHandbrake ? 11.0 : 14.0;
-  car.yawRate += (targetYawRate - car.yawRate) * Math.min(1, yawResponse * dt);
-  car.yaw += car.yawRate * dt;
+  car.isBraking = braking;
 
-  // Re-evaluate basis vectors after yaw update? Actually apply lateral grip in current heading:
-  // When handbrake is held, lateral grip drops sharply so the car slides through the corner!
-  const effectiveGrip = wantHandbrake
-    ? car.spec.grip * 0.24
-    : car.isDrifting
-      ? car.spec.grip * 0.56
-      : car.spec.grip;
+  // Aerodynamic + rolling drag (boost scales aero drag cap smoothly)
+  const aeroCoef = car.isBoosting ? AERO_DRAG * 0.68 : AERO_DRAG;
+  const drag = ROLLING_DRAG * vLong + aeroCoef * vLong * Math.abs(vLong);
+  vLong += (accelLong - drag) * dt;
+  vLong = Math.max(-MAX_REVERSE_SPEED, Math.min(activeTopSpeed * 1.04, vLong));
 
-  // Lateral grip damps sideways slip velocity toward 0
-  vLat *= Math.exp(-effectiveGrip * dt);
+  // Steering angular rate
+  const speedFactor = Math.min(1, speedMag / 9.5);
+  const highSpeedTaper = 1.0 / (1.0 + 0.011 * Math.max(0, speedMag - 22));
+  const driftTurnBoost = wantDrift ? 1.38 : 1.0;
+  const reverseSign = vLong >= -0.5 ? 1 : -1;
+  const targetYawRate = input.steer * 2.55 * speedFactor * highSpeedTaper * driftTurnBoost * reverseSign;
 
-  // Subtle drift kick when initiating handbrake slide with steering
-  if (wantHandbrake && Math.abs(input.steer) > 0.2) {
-    // Turning right (+steer) kicks rear left (-rx) -> positive forward-aligned drift slip toward -steer
-    vLat -= input.steer * 9.5 * dt;
+  car.angularVel += (targetYawRate - car.angularVel) * Math.min(1, (wantDrift ? 11 : 16) * dt);
+  car.heading = normalizeAngle(car.heading + car.angularVel * dt);
+
+  const newFx = Math.cos(car.heading);
+  const newFz = Math.sin(car.heading);
+  const newRx = -newFz;
+  const newRz = newFx;
+
+  const worldVx = fx * vLong + rx * vLat;
+  const worldVz = fz * vLong + rz * vLat;
+
+  let newVLong = worldVx * newFx + worldVz * newFz;
+  let newVLat = worldVx * newRx + worldVz * newRz;
+
+  // Off-track check & grip
+  const offTrack = Math.abs(car.trackD) > ROAD_HALF_WIDTH + 0.65;
+  car.isOffTrack = offTrack;
+
+  const baseGrip = wantDrift ? 2.45 : offTrack ? 5.3 : 9.4 * car.spec.cornerGripSkill;
+  const gripDecay = Math.exp(-baseGrip * dt);
+  newVLat *= gripDecay;
+
+  if (offTrack && Math.abs(newVLong) > 14) {
+    newVLong *= Math.exp(-1.15 * dt);
   }
 
-  // Reconstruct world velocity from updated heading
-  const nfx = Math.sin(car.yaw);
-  const nfz = Math.cos(car.yaw);
-  const nrx = -nfz;
-  const nrz = nfx;
-
-  car.vx = nfx * vFwd + nrx * vLat;
-  car.vz = nfz * vFwd + nrz * vLat;
+  car.vx = newFx * newVLong + newRx * newVLat;
+  car.vz = newFz * newVLong + newRz * newVLat;
+  car.forwardSpeed = newVLong;
+  car.lateralSpeed = newVLat;
 
   car.x += car.vx * dt;
   car.z += car.vz * dt;
 
-  // Visual wheel spin & suspension roll/pitch
-  car.speed = vFwd;
-  car.speedKmh = Math.abs(vFwd) * 3.6;
-  car.wheelSpin += (vFwd / 0.36) * dt; // 0.36m wheel radius
-
-  const targetRoll = Math.max(-0.09, Math.min(0.09, -car.yawRate * 0.032 - vLat * 0.004));
-  const targetPitch = Math.max(-0.045, Math.min(0.045, -accelFwd * 0.0014));
-  car.bodyRoll += (targetRoll - car.bodyRoll) * Math.min(1, 12 * dt);
+  car.wheelSpin += (newVLong / WHEEL_RADIUS) * dt;
+  const targetRoll = Math.max(-0.085, Math.min(0.085, newVLat * 0.008 + input.steer * Math.min(1, speedMag / 25) * 0.045));
+  const targetPitch = Math.max(-0.055, Math.min(0.055, -accelLong * 0.001));
+  car.bodyRoll += (targetRoll - car.bodyRoll) * Math.min(1, 10 * dt);
   car.bodyPitch += (targetPitch - car.bodyPitch) * Math.min(1, 10 * dt);
+
+  // Off-track dust particles
+  const newSpeedMag = Math.hypot(car.vx, car.vz);
+  if (offTrack && newSpeedMag > 6.5) {
+    events.push({
+      type: 'dust',
+      carIndex: car.index,
+      x: car.x - newFx * 1.4,
+      z: car.z - newFz * 1.4,
+      heading: car.heading,
+      intensity: Math.min(1, newSpeedMag / 35),
+    });
+  }
+
+  // Drift angle, scoring, combo, smoke & skid marks
+  const slipMag = Math.abs(newVLat);
+  const slipAngleDeg = newVLong > 3 ? (Math.atan2(slipMag, newVLong) * 180) / Math.PI : 0;
+  car.driftAngleDeg = car.isDrifting ? Math.min(89, Math.round(slipAngleDeg)) : 0;
+
+  if (car.isDrifting && newSpeedMag > 10 && slipAngleDeg > 6 && !offTrack) {
+    car.driftTime += dt;
+    car.driftCombo = Math.min(5, 1 + Math.floor(car.driftTime / 1.15));
+    car.bestDriftCombo = Math.max(car.bestDriftCombo, car.driftCombo);
+    const rate = newSpeedMag * 2.4 + Math.min(45, slipAngleDeg) * 2.2;
+    car.currentDriftScore += rate * dt;
+    car.nitro = Math.min(100, car.nitro + 12.5 * dt);
+  } else if (!car.isDrifting && car.currentDriftScore > 0) {
+    if (car.currentDriftScore >= 24 && newSpeedMag > 8) {
+      const banked = Math.round(car.currentDriftScore * car.driftCombo);
+      car.totalDriftScore += banked;
+      car.nitro = Math.min(100, car.nitro + Math.min(18, 4.5 * car.driftCombo));
+      events.push({
+        type: 'drift_bank',
+        carIndex: car.index,
+        value: banked,
+        extra: car.driftCombo,
+      });
+    }
+    car.currentDriftScore = 0;
+    car.driftTime = 0;
+    car.driftCombo = 1;
+  }
+
+  // Spinout breaks drift combo
+  if (car.currentDriftScore > 20 && (newSpeedMag < 5.5 || slipAngleDeg > 78)) {
+    car.currentDriftScore = 0;
+    car.driftTime = 0;
+    car.driftCombo = 1;
+    events.push({ type: 'drift_break', carIndex: car.index });
+  }
+
+  if ((wantDrift || slipMag > 4.4) && newSpeedMag > 9.5) {
+    const intensity = Math.min(1, (slipMag - 1.5) / 10);
+    if (intensity > 0.08) {
+      events.push({
+        type: 'skid',
+        carIndex: car.index,
+        x: car.x - newFx * 1.25,
+        z: car.z - newFz * 1.25,
+        heading: car.heading,
+        intensity,
+      });
+      events.push({
+        type: 'smoke',
+        carIndex: car.index,
+        x: car.x - newFx * 1.35,
+        z: car.z - newFz * 1.35,
+        heading: car.heading,
+        intensity,
+      });
+    }
+  }
+
+  // Project onto track & clean-corner nitro reward
+  const proj = track.project(car.x, car.z, car.trackIdx);
+  car.trackIdx = proj.idx;
+  car.trackS = proj.s;
+  car.trackD = proj.d;
+
+  const absK = Math.abs(proj.kappa);
+  if (absK > 0.013) {
+    if (!car.inCornerZone) {
+      car.inCornerZone = true;
+      car.cornerClean = !offTrack;
+    } else if (offTrack) {
+      car.cornerClean = false;
+    }
+  } else if (car.inCornerZone && absK < 0.008) {
+    if (car.cornerClean && newSpeedMag > 16) {
+      car.nitro = Math.min(100, car.nitro + 10);
+    }
+    car.inCornerZone = false;
+    car.cornerClean = true;
+  }
+
+  // Enforce barrier collision
+  const maxD = BARRIER_HALF_WIDTH - CAR_RADIUS;
+  let barrierHit = false;
+
+  if (Math.abs(proj.d) > maxD) {
+    const sign = proj.d >= 0 ? 1 : -1;
+    const clampedD = sign * maxD;
+    car.x = proj.x + proj.nx * clampedD;
+    car.z = proj.z + proj.nz * clampedD;
+    car.trackD = clampedD;
+    car.cornerClean = false;
+
+    const outNx = proj.nx * sign;
+    const outNz = proj.nz * sign;
+    const vOut = car.vx * outNx + car.vz * outNz;
+
+    if (vOut > 0) {
+      const restitution = 0.28;
+      car.vx -= (1 + restitution) * vOut * outNx;
+      car.vz -= (1 + restitution) * vOut * outNz;
+      const tx = proj.tx;
+      const tz = proj.tz;
+      const vTan = car.vx * tx + car.vz * tz;
+      const vIn = car.vx * outNx + car.vz * outNz;
+      car.vx = tx * (vTan * 0.88) + outNx * vIn;
+      car.vz = tz * (vTan * 0.88) + outNz * vIn;
+
+      const trackHeading = Math.atan2(proj.tz, proj.tx);
+      const headingErr = normalizeAngle(trackHeading - car.heading);
+      if (Math.abs(headingErr) > 0.35) {
+        car.heading = normalizeAngle(car.heading + headingErr * Math.min(0.45, dt * 6));
+      }
+
+      if (vOut > 5.0 && car.currentDriftScore > 15) {
+        car.currentDriftScore = 0;
+        car.driftTime = 0;
+        car.driftCombo = 1;
+        events.push({ type: 'drift_break', carIndex: car.index });
+      }
+
+      if (vOut > 2.2 && car.barrierHitCooldown <= 0) {
+        barrierHit = true;
+        car.collisions += 1;
+        car.barrierHitCooldown = 0.5;
+        events.push({
+          type: 'barrier',
+          carIndex: car.index,
+          x: car.x,
+          z: car.z,
+          intensity: Math.min(1, vOut / 25),
+        });
+        if (vOut > 4.5) {
+          events.push({
+            type: 'sparks',
+            carIndex: car.index,
+            x: car.x + outNx * 0.6,
+            z: car.z + outNz * 0.6,
+            intensity: Math.min(1, vOut / 22),
+          });
+        }
+      }
+    }
+  }
+
+  car.forwardSpeed = car.vx * Math.cos(car.heading) + car.vz * Math.sin(car.heading);
+  car.lateralSpeed = car.vx * -Math.sin(car.heading) + car.vz * Math.cos(car.heading);
+
+  return { barrierHit };
 }
 
-/**
- * Resolve car-to-car collisions using 2-circle rigid body approximation per car
- * so bumpers and side doors collide accurately without tunneling or overlapping.
- */
-export function resolveCarCollisions(cars: CarState[]): void {
-  const circleRadius = 0.96;
-  const minDist = circleRadius * 2;
+export function resolveCarCollisions(
+  cars: CarState[],
+  track: CircuitTrack,
+  events: SimEvent[]
+): void {
+  const minDist = CIRCLE_RADIUS * 2;
   const minDistSq = minDist * minDist;
-  const halfOffset = 1.15; // front & rear circle centers along car forward vector
 
   for (let i = 0; i < cars.length; i++) {
     const a = cars[i];
-    const afx = Math.sin(a.yaw);
-    const afz = Math.cos(a.yaw);
+    const afx = Math.cos(a.heading);
+    const afz = Math.sin(a.heading);
 
     for (let j = i + 1; j < cars.length; j++) {
       const b = cars[j];
-      // Broadphase check
-      const dxCenter = b.x - a.x;
-      const dzCenter = b.z - a.z;
-      if (dxCenter * dxCenter + dzCenter * dzCenter > 25.0) continue;
+      const dxBroad = b.x - a.x;
+      const dzBroad = b.z - a.z;
+      if (dxBroad * dxBroad + dzBroad * dzBroad > 26) continue;
 
-      const bfx = Math.sin(b.yaw);
-      const bfz = Math.cos(b.yaw);
+      const bfx = Math.cos(b.heading);
+      const bfz = Math.sin(b.heading);
 
-      // Test all 4 circle pairs and pick the deepest overlap
       let deepestOverlap = 0;
-      let hitNx = 0;
-      let hitNz = 0;
-      let hitLeverA = 0;
-      let hitLeverB = 0;
+      let bestNx = 0;
+      let bestNz = 0;
 
-      for (const sa of [-halfOffset, halfOffset]) {
-        const ax = a.x + afx * sa;
-        const az = a.z + afz * sa;
-        for (const sb of [-halfOffset, halfOffset]) {
-          const bx = b.x + bfx * sb;
-          const bz = b.z + bfz * sb;
+      for (let sa = -1; sa <= 1; sa += 2) {
+        const ax = a.x + afx * CIRCLE_OFFSET * sa;
+        const az = a.z + afz * CIRCLE_OFFSET * sa;
+        for (let sb = -1; sb <= 1; sb += 2) {
+          const bx = b.x + bfx * CIRCLE_OFFSET * sb;
+          const bz = b.z + bfz * CIRCLE_OFFSET * sb;
           const dx = bx - ax;
           const dz = bz - az;
           const dSq = dx * dx + dz * dz;
           if (dSq < minDistSq) {
-            const d = Math.sqrt(dSq) || 0.001;
-            const overlap = minDist - d;
+            const dist = Math.sqrt(dSq) || 0.001;
+            const overlap = minDist - dist;
             if (overlap > deepestOverlap) {
               deepestOverlap = overlap;
-              hitNx = dx / d;
-              hitNz = dz / d;
-              hitLeverA = sa;
-              hitLeverB = sb;
+              bestNx = dx / dist;
+              bestNz = dz / dist;
             }
           }
         }
       }
 
       if (deepestOverlap > 0) {
-        // Positional separation
-        const sep = deepestOverlap * 0.52;
-        a.x -= hitNx * sep;
-        a.z -= hitNz * sep;
-        b.x += hitNx * sep;
-        b.z += hitNz * sep;
+        const push = deepestOverlap * 0.52;
+        a.x -= bestNx * push;
+        a.z -= bestNz * push;
+        b.x += bestNx * push;
+        b.z += bestNz * push;
 
-        // Relative velocity along contact normal (from A to B)
         const rvx = b.vx - a.vx;
         const rvz = b.vz - a.vz;
-        const velAlongNormal = rvx * hitNx + rvz * hitNz;
+        const velAlongNormal = rvx * bestNx + rvz * bestNz;
 
         if (velAlongNormal < 0) {
           const restitution = 0.35;
-          const jImpulse = -(1 + restitution) * velAlongNormal * 0.5;
-          a.vx -= hitNx * jImpulse;
-          a.vz -= hitNz * jImpulse;
-          b.vx += hitNx * jImpulse;
-          b.vz += hitNz * jImpulse;
+          const jImp = (-(1 + restitution) * velAlongNormal) * 0.5;
+          a.vx -= jImp * bestNx;
+          a.vz -= jImp * bestNz;
+          b.vx += jImp * bestNx;
+          b.vz += jImp * bestNz;
 
-          // Subtle rotational nudge on corner hits
-          const crossA = afx * hitNz - afz * hitNx;
-          const crossB = bfx * hitNz - bfz * hitNx;
-          a.yawRate -= crossA * hitLeverA * jImpulse * 0.06;
-          b.yawRate += crossB * hitLeverB * jImpulse * 0.06;
+          if (-velAlongNormal > 4.0) {
+            const intensity = Math.min(1, -velAlongNormal / 22);
+            const midX = (a.x + b.x) * 0.5;
+            const midZ = (a.z + b.z) * 0.5;
+            if (a.carHitCooldown <= 0) {
+              a.collisions += 1;
+              a.carHitCooldown = 0.45;
+            }
+            if (b.carHitCooldown <= 0) {
+              b.collisions += 1;
+              b.carHitCooldown = 0.45;
+            }
+            events.push({
+              type: 'car_hit',
+              carIndex: a.index,
+              otherIndex: b.index,
+              x: midX,
+              z: midZ,
+              intensity,
+            });
+            events.push({
+              type: 'sparks',
+              carIndex: a.index,
+              x: midX,
+              z: midZ,
+              intensity,
+            });
+          }
+        }
 
-          const impactMag = Math.min(1, Math.abs(velAlongNormal) / 22);
-          a.lastImpactIntensity = Math.max(a.lastImpactIntensity, impactMag);
-          b.lastImpactIntensity = Math.max(b.lastImpactIntensity, impactMag);
+        const maxD = BARRIER_HALF_WIDTH - CAR_RADIUS;
+        for (const car of [a, b]) {
+          const proj = track.project(car.x, car.z, car.trackIdx);
+          car.trackIdx = proj.idx;
+          car.trackS = proj.s;
+          car.trackD = proj.d;
+          if (Math.abs(proj.d) > maxD) {
+            const sign = proj.d >= 0 ? 1 : -1;
+            car.x = proj.x + proj.nx * (sign * maxD);
+            car.z = proj.z + proj.nz * (sign * maxD);
+            car.trackD = sign * maxD;
+          }
         }
       }
     }
   }
-}
-
-/**
- * Clamp car strictly inside circuit barriers and count distinct barrier impacts.
- */
-export function resolveBarrierCollision(car: CarState): { projection: TrackProjection; hitBarrier: boolean } {
-  const proj = CIRCUIT.projectPoint(car.x, car.z, car.sampleIndex);
-  const maxLateral = CIRCUIT.barrierHalfWidth - 1.15;
-  let hitBarrier = false;
-
-  if (Math.abs(proj.lateral) > maxLateral) {
-    const sign = proj.lateral > 0 ? 1 : -1;
-    const clampedLat = sign * maxLateral;
-    car.x = proj.cx + proj.rx * clampedLat;
-    car.z = proj.cz + proj.rz * clampedLat;
-
-    // Velocity component into the barrier along (sign * rx, sign * rz)
-    const nx = sign * proj.rx;
-    const nz = sign * proj.rz;
-    const vIntoWall = car.vx * nx + car.vz * nz;
-
-    if (vIntoWall > 0) {
-      // Reflect & damp outward velocity, scrub slight tangential speed
-      const bounce = 0.25;
-      car.vx -= (1 + bounce) * vIntoWall * nx;
-      car.vz -= (1 + bounce) * vIntoWall * nz;
-      car.vx *= 0.94;
-      car.vz *= 0.94;
-
-      if (vIntoWall > 1.8 && car.barrierHitCooldown <= 0) {
-        hitBarrier = true;
-        car.barrierHitCooldown = 0.45;
-        car.lastImpactIntensity = Math.max(car.lastImpactIntensity, Math.min(1, vIntoWall / 18));
-      }
-    }
-
-    // Gently deflect heading back toward track tangent so cars don't nose-lock into walls
-    const trackYaw = Math.atan2(proj.tx, proj.tz);
-    let yawDiff = trackYaw - car.yaw;
-    while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
-    while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
-    if (Math.abs(yawDiff) > 0.25) {
-      car.yaw += yawDiff * 0.14;
-    }
-  }
-
-  // Recompute projection after possible clamp
-  const finalProj =
-    Math.abs(proj.lateral) > maxLateral
-      ? CIRCUIT.projectPoint(car.x, car.z, proj.sampleIndex)
-      : proj;
-
-  car.sampleIndex = finalProj.sampleIndex;
-  car.s = finalProj.s;
-  car.lateral = finalProj.lateral;
-
-  return { projection: finalProj, hitBarrier };
-}
-
-/**
- * Reset car onto the track centerline at its current track progress s.
- */
-export function resetCarToTrack(car: CarState): void {
-  const smp = CIRCUIT.sampleAtS(car.s);
-  car.x = smp.x;
-  car.z = smp.z;
-  car.vx = 0;
-  car.vz = 0;
-  car.yaw = Math.atan2(smp.tx, smp.tz);
-  car.yawRate = 0;
-  car.steerAngle = 0;
-  car.speed = 0;
-  car.speedKmh = 0;
-  car.isDrifting = false;
-  car.driftIntensity = 0;
-  car.sampleIndex = smp.index;
-  car.lateral = 0;
 }

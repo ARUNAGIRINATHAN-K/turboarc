@@ -1,6 +1,6 @@
 {
-  "name": "Apex Circuit 3D Racing",
-  "description": "Self-contained 3D arcade car racing game with drift physics, 5 AI rivals, chase/cockpit cameras, and deterministic race simulation.",
+  "name": "Apex Circuit 3D",
+  "description": "3D arcade car racing game with drifting, AI opponents, chase and cockpit cameras, and deterministic benchmarking in racing.html.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

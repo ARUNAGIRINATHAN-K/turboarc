@@ -1,379 +1,513 @@
+import { CarSpec } from './types';
+
 export interface TrackSample {
-  index: number;
+  s: number;
   x: number;
   z: number;
-  tx: number; // unit forward tangent X
-  tz: number; // unit forward tangent Z
-  rx: number; // unit right normal X (left-to-right perpendicular in XZ plane)
-  rz: number; // unit right normal Z
-  s: number;  // cumulative arc length from start/finish (0 .. totalLength)
-  curvature: number; // signed curvature (rad/m); positive = turning right, negative = turning left
-  racingOffset: number; // preferred lateral offset (m) for optimal racing line
+  tx: number;
+  tz: number;
+  nx: number;
+  nz: number;
+  kappa: number;
+  racingOffset: number;
+  /** 0 = safe green throttle, 0.5 = yellow approach, 1 = red braking zone */
+  brakeIntensity: number;
 }
 
 export interface TrackProjection {
-  sampleIndex: number;
+  idx: number;
   s: number;
-  lateral: number; // signed distance along right normal (+ = right, - = left)
+  d: number;
+  x: number;
+  z: number;
   tx: number;
   tz: number;
-  rx: number;
-  rz: number;
-  cx: number;
-  cz: number;
-  curvature: number;
+  nx: number;
+  nz: number;
+  kappa: number;
   racingOffset: number;
 }
 
-export interface CircuitTrack {
-  samples: TrackSample[];
-  totalLength: number;
-  roadHalfWidth: number;
-  kerbWidth: number;
-  barrierHalfWidth: number;
-  minX: number;
-  maxX: number;
-  minZ: number;
-  maxZ: number;
-  sampleAtS(s: number): TrackSample;
-  projectPoint(x: number, z: number, hintIndex?: number): TrackProjection;
-  wrapS(s: number): number;
+export interface CornerMarker {
+  cornerNumber: number;
+  label: string;
+  apexS: number;
+  turnDir: number; // +1 right, -1 left
+  hasBrakingBoards: boolean;
 }
 
-export const ROAD_HALF_WIDTH = 9.0;     // 18m total asphalt width
-export const KERB_WIDTH = 1.35;         // 1.35m red/white kerbs outside asphalt
-export const BARRIER_HALF_WIDTH = 11.2; // Physical barrier walls at ±11.2m
+export const ROAD_HALF_WIDTH = 8.5; // 17m wide asphalt
+export const KERB_WIDTH = 0.95;
+export const BARRIER_HALF_WIDTH = 11.2; // 22.4m between outer barriers
 
-/**
- * Closed circuit control points (clockwise in XZ plane, starting at (0, 0) heading +Z).
- * Designed with:
- * - Long main start/finish straight along +Z
- * - Fast Turn 1 right-hand sweeper
- * - Flowing high-speed S-curves
- * - Back straight braking into a tight 180-degree hairpin
- * - Fast double-apex return back onto the main straight
- */
-const CONTROL_POINTS: ReadonlyArray<[number, number]> = [
-  [0, -90],
-  [0, 10],      // Start/finish line at s ≈ 0..90
-  [0, 125],     // End of main straight
-  [35, 195],    // Fast Turn 1 entry
-  [115, 225],   // Fast Turn 1 sweeper apex
-  [215, 210],   // High-speed sweeper exit
-  [280, 155],   // Sweeper kink right
-  [265, 75],    // Chicane / S-curve left
-  [315, 10],    // S-curve right
-  [380, -35],   // Back straight entry
-  [410, -125],  // Back straight fast braking zone
-  [370, -185],  // Tight Hairpin entry
-  [310, -170],  // Tight Hairpin apex
-  [315, -105],  // Hairpin exit
-  [245, -75],   // Technical kink left
-  [175, -135],  // Fast Esses right
-  [105, -175],  // Final long sweeping corner entry
-  [25, -165],   // Final corner apex onto main straight
+const CONTROL_POINTS: Array<[number, number]> = [
+  [-120, 0],
+  [-40, 0],
+  [40, 0],
+  [125, 0],    // End of long main straight
+  [195, 14],   // Turn 1 entry
+  [235, 62],   // Fast sweeper apex
+  [215, 125],  // Sweeper exit
+  [155, 155],  // Turn 2 S-entry
+  [105, 195],  // Turn 3 sweeper crest
+  [40, 225],   // Back straight entry
+  [-45, 220],  // Back straight
+  [-115, 200], // Heavy braking into hairpin
+  [-168, 228], // Turn 4 Tight Hairpin entry
+  [-195, 200], // Tight Hairpin apex
+  [-165, 165], // Tight Hairpin exit
+  [-95, 152],  // Acceleration chute
+  [-65, 110],  // Turn 5 Chicane left
+  [-115, 75],  // Turn 6 Chicane right
+  [-175, 48],  // Final sweeper entry
+  [-180, 12],  // Final corner exit onto main straight
 ];
 
-function catmullRomPoint(
-  p0: readonly [number, number],
-  p1: readonly [number, number],
-  p2: readonly [number, number],
-  p3: readonly [number, number],
-  t: number
-): [number, number] {
+function catmullRom(p0: number, p1: number, p2: number, p3: number, t: number): number {
   const t2 = t * t;
   const t3 = t2 * t;
-  const x =
+  return (
     0.5 *
-    (2 * p1[0] +
-      (-p0[0] + p2[0]) * t +
-      (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
-      (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
-  const z =
-    0.5 *
-    (2 * p1[1] +
-      (-p0[1] + p2[1]) * t +
-      (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
-      (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
-  return [x, z];
+    (2 * p1 +
+      (-p0 + p2) * t +
+      (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+      (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+  );
 }
 
-function buildCircuit(): CircuitTrack {
-  const nCtrl = CONTROL_POINTS.length;
-  const rawCount = 1800;
-  const rawPts: Array<[number, number]> = [];
+export class CircuitTrack {
+  readonly samples: TrackSample[];
+  readonly totalLength: number;
+  readonly count: number;
+  readonly bounds: { minX: number; maxX: number; minZ: number; maxZ: number };
+  readonly corners: CornerMarker[];
 
-  for (let i = 0; i < rawCount; i++) {
-    const u = (i / rawCount) * nCtrl;
-    const seg = Math.floor(u) % nCtrl;
-    const t = u - Math.floor(u);
-    const p0 = CONTROL_POINTS[(seg - 1 + nCtrl) % nCtrl];
-    const p1 = CONTROL_POINTS[seg];
-    const p2 = CONTROL_POINTS[(seg + 1) % nCtrl];
-    const p3 = CONTROL_POINTS[(seg + 2) % nCtrl];
-    rawPts.push(catmullRomPoint(p0, p1, p2, p3, t));
-  }
+  constructor(sampleCount = 640) {
+    this.count = sampleCount;
 
-  // Compute raw cumulative arc lengths and resample uniformly at N = 640 points
-  const cumLen: number[] = [0];
-  for (let i = 1; i <= rawCount; i++) {
-    const prev = rawPts[i - 1];
-    const curr = rawPts[i % rawCount];
-    cumLen.push(cumLen[i - 1] + Math.hypot(curr[0] - prev[0], curr[1] - prev[1]));
-  }
-  const totalRawLength = cumLen[rawCount];
+    const denseN = 4000;
+    const nCtrl = CONTROL_POINTS.length;
+    const denseX = new Float64Array(denseN);
+    const denseZ = new Float64Array(denseN);
+    const cumLen = new Float64Array(denseN + 1);
 
-  // Shift arc length s = 0 to start/finish near x = 0, z = 0 (index near seg=1)
-  // Find raw point closest to (0, 0) with +Z direction
-  let startRawIdx = 0;
-  let bestDist = Infinity;
-  for (let i = 0; i < rawCount; i++) {
-    const [px, pz] = rawPts[i];
-    const next = rawPts[(i + 1) % rawCount];
-    if (next[1] - pz > 0) {
-      const d = px * px + pz * pz;
-      if (d < bestDist) {
-        bestDist = d;
-        startRawIdx = i;
-      }
-    }
-  }
-
-  const reorderedRaw: Array<[number, number]> = [];
-  for (let i = 0; i < rawCount; i++) {
-    reorderedRaw.push(rawPts[(startRawIdx + i) % rawCount]);
-  }
-
-  const rawS: number[] = [0];
-  for (let i = 1; i <= rawCount; i++) {
-    const a = reorderedRaw[i - 1];
-    const b = reorderedRaw[i % rawCount];
-    rawS.push(rawS[i - 1] + Math.hypot(b[0] - a[0], b[1] - a[1]));
-  }
-  const totalLength = rawS[rawCount];
-
-  const sampleCount = 640;
-  const pts: Array<[number, number]> = [];
-  let rIdx = 0;
-  for (let i = 0; i < sampleCount; i++) {
-    const targetS = (i / sampleCount) * totalLength;
-    while (rIdx < rawCount - 1 && rawS[rIdx + 1] < targetS) {
-      rIdx++;
-    }
-    const s0 = rawS[rIdx];
-    const s1 = rawS[rIdx + 1];
-    const alpha = s1 > s0 ? (targetS - s0) / (s1 - s0) : 0;
-    const pA = reorderedRaw[rIdx];
-    const pB = reorderedRaw[(rIdx + 1) % rawCount];
-    pts.push([pA[0] + (pB[0] - pA[0]) * alpha, pA[1] + (pB[1] - pA[1]) * alpha]);
-  }
-
-  // Build TrackSample entries with tangents, right normals, curvature
-  const samples: TrackSample[] = [];
-  let accS = 0;
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minZ = Infinity;
-  let maxZ = -Infinity;
-
-  for (let i = 0; i < sampleCount; i++) {
-    const prev = pts[(i - 1 + sampleCount) % sampleCount];
-    const curr = pts[i];
-    const next = pts[(i + 1) % sampleCount];
-
-    if (i > 0) {
-      accS += Math.hypot(curr[0] - prev[0], curr[1] - prev[1]);
+    for (let i = 0; i < denseN; i++) {
+      const u = (i / denseN) * nCtrl;
+      const seg = Math.floor(u) % nCtrl;
+      const t = u - Math.floor(u);
+      const p0 = CONTROL_POINTS[(seg - 1 + nCtrl) % nCtrl];
+      const p1 = CONTROL_POINTS[seg];
+      const p2 = CONTROL_POINTS[(seg + 1) % nCtrl];
+      const p3 = CONTROL_POINTS[(seg + 2) % nCtrl];
+      denseX[i] = catmullRom(p0[0], p1[0], p2[0], p3[0], t);
+      denseZ[i] = catmullRom(p0[1], p1[1], p2[1], p3[1], t);
     }
 
-    const dx = next[0] - prev[0];
-    const dz = next[1] - prev[1];
-    const len = Math.hypot(dx, dz) || 1;
-    const tx = dx / len;
-    const tz = dz / len;
-    // Right normal in XZ plane when forward is (tx, tz) with +Y up:
-    // For forward (0, 1) (+Z), right is (-1, 0) or (+1, 0)?
-    // Wait: in Three.js, +Y up, +Z forward -> right-hand cross(forward, up) = (0,0,1) x (0,1,0) = (-1, 0, 0).
-    // Let's check: cross(forward, up) = (tz * 0 - 0 * 1, ..., tx * 1 - tz * 0) -> wait:
-    // (tx, 0, tz) x (0, 1, 0) = (0*0 - tz*1, tz*0 - tx*0, tx*1 - 0*0) = (-tz, 0, tx)!
-    // Wait: if forward = (0, 0, 1) (+Z), looking down +Z with +Y up, -X is to the RIGHT, +X is to the LEFT!
-    // Let's verify: in Three.js default camera at (0,0,5) looking at (0,0,0) (toward -Z): +X is right, -X is left.
-    // When facing +Z (opposite), +X is LEFT and -X is RIGHT!
-    // Using rx = -tz, rz = tx guarantees (tx, 0, tz) x (0, 1, 0) = (rx, 0, rz), i.e., true geometric right!
-    const rx = -tz;
-    const rz = tx;
-
-    // Signed curvature from Menger curvature of (prev, curr, next)
-    const ax = curr[0] - prev[0];
-    const az = curr[1] - prev[1];
-    const bx = next[0] - curr[0];
-    const bz = next[1] - curr[1];
-    const cross = ax * bz - az * bx; // positive when turning toward -Z x +X? Let's check sign with (rx, rz):
-    // If forward = (0, 1), right = (-1, 0). Turning right means next has negative X: bx < 0, az > 0 => ax*bz - az*bx > 0!
-    // So cross > 0 means turning RIGHT (positive lateral direction)!
-    const da = Math.hypot(ax, az);
-    const db = Math.hypot(bx, bz);
-    const dc = Math.hypot(next[0] - prev[0], next[1] - prev[1]);
-    const denom = da * db * dc || 1;
-    const curvature = (2 * cross) / denom;
-
-    minX = Math.min(minX, curr[0]);
-    maxX = Math.max(maxX, curr[0]);
-    minZ = Math.min(minZ, curr[1]);
-    maxZ = Math.max(maxZ, curr[1]);
-
-    samples.push({
-      index: i,
-      x: curr[0],
-      z: curr[1],
-      tx,
-      tz,
-      rx,
-      rz,
-      s: accS,
-      curvature,
-      racingOffset: 0,
-    });
-  }
-
-  // Smooth curvature & compute optimal racing line offset (hug inside apex on corners, swing wide before/after)
-  const smoothCurv = new Array<number>(sampleCount).fill(0);
-  const window = 6;
-  for (let i = 0; i < sampleCount; i++) {
-    let sum = 0;
-    for (let k = -window; k <= window; k++) {
-      sum += samples[(i + k + sampleCount) % sampleCount].curvature;
+    let total = 0;
+    cumLen[0] = 0;
+    for (let i = 0; i < denseN; i++) {
+      const next = (i + 1) % denseN;
+      const dx = denseX[next] - denseX[i];
+      const dz = denseZ[next] - denseZ[i];
+      total += Math.hypot(dx, dz);
+      cumLen[i + 1] = total;
     }
-    smoothCurv[i] = sum / (window * 2 + 1);
-  }
+    this.totalLength = total;
 
-  // Look ahead/behind for racing line: inside apex for peak curvature, subtle outside entry/exit
-  const rawOffset = new Array<number>(sampleCount).fill(0);
-  for (let i = 0; i < sampleCount; i++) {
-    const c = smoothCurv[i];
-    // Turn right (c > 0): hug right apex (+lat); turn left (c < 0): hug left apex (-lat)
-    // Entry/exit counter-swing comes from averaging nearby negative-weighted curvature
-    const cAhead = smoothCurv[(i + 14) % sampleCount];
-    const cBehind = smoothCurv[(i - 14 + sampleCount) % sampleCount];
-    const target = c * 280 - (cAhead + cBehind) * 55;
-    rawOffset[i] = Math.max(-ROAD_HALF_WIDTH * 0.58, Math.min(ROAD_HALF_WIDTH * 0.58, target));
-  }
-
-  // Smooth racingOffset with wide Gaussian-like passes so AI steering is silky smooth
-  let buf = rawOffset.slice();
-  for (let pass = 0; pass < 4; pass++) {
-    const nextBuf = new Array<number>(sampleCount);
+    const rawSamples: Array<{ s: number; x: number; z: number }> = [];
+    let denseIdx = 0;
     for (let i = 0; i < sampleCount; i++) {
-      let acc = 0;
-      for (let k = -4; k <= 4; k++) {
-        acc += buf[(i + k + sampleCount) % sampleCount];
+      const targetS = (i / sampleCount) * total;
+      while (denseIdx < denseN - 1 && cumLen[denseIdx + 1] < targetS) {
+        denseIdx++;
       }
-      nextBuf[i] = acc / 9;
+      const s0 = cumLen[denseIdx];
+      const s1 = cumLen[denseIdx + 1];
+      const alpha = s1 > s0 ? (targetS - s0) / (s1 - s0) : 0;
+      const next = (denseIdx + 1) % denseN;
+      rawSamples.push({
+        s: targetS,
+        x: denseX[denseIdx] + (denseX[next] - denseX[denseIdx]) * alpha,
+        z: denseZ[denseIdx] + (denseZ[next] - denseZ[denseIdx]) * alpha,
+      });
     }
-    buf = nextBuf;
+
+    const ds = total / sampleCount;
+    const samples: TrackSample[] = [];
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+
+    for (let i = 0; i < sampleCount; i++) {
+      const prev = rawSamples[(i - 1 + sampleCount) % sampleCount];
+      const curr = rawSamples[i];
+      const next = rawSamples[(i + 1) % sampleCount];
+      const dx = next.x - prev.x;
+      const dz = next.z - prev.z;
+      const len = Math.hypot(dx, dz) || 1;
+      const tx = dx / len;
+      const tz = dz / len;
+      const nx = -tz;
+      const nz = tx;
+
+      if (curr.x < minX) minX = curr.x;
+      if (curr.x > maxX) maxX = curr.x;
+      if (curr.z < minZ) minZ = curr.z;
+      if (curr.z > maxZ) maxZ = curr.z;
+
+      samples.push({
+        s: curr.s,
+        x: curr.x,
+        z: curr.z,
+        tx,
+        tz,
+        nx,
+        nz,
+        kappa: 0,
+        racingOffset: 0,
+        brakeIntensity: 0,
+      });
+    }
+
+    this.bounds = { minX, maxX, minZ, maxZ };
+
+    const win = 4;
+    const rawKappa = new Float64Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) {
+      const p = samples[(i - win + sampleCount) % sampleCount];
+      const n = samples[(i + win) % sampleCount];
+      const cross = p.tx * n.tz - p.tz * n.tx;
+      const dot = Math.max(-1, Math.min(1, p.tx * n.tx + p.tz * n.tz));
+      const dTheta = Math.atan2(cross, dot);
+      rawKappa[i] = dTheta / (2 * win * ds);
+    }
+
+    for (let i = 0; i < sampleCount; i++) {
+      let sum = 0;
+      for (let k = -3; k <= 3; k++) {
+        sum += rawKappa[(i + k + sampleCount) % sampleCount];
+      }
+      samples[i].kappa = sum / 7;
+    }
+
+    const rawOffset = new Float64Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) {
+      const kLocal = samples[i].kappa;
+      const kAhead = samples[(i + 14) % sampleCount].kappa;
+      const kBehind = samples[(i - 14 + sampleCount) % sampleCount].kappa;
+      const apexPull = Math.tanh(kLocal * 42) * 5.2;
+      const entrySwing = -Math.tanh(kAhead * 36) * 3.0;
+      const exitSwing = -Math.tanh(kBehind * 36) * 2.4;
+      rawOffset[i] = Math.max(-5.5, Math.min(5.5, apexPull + entrySwing * 0.55 + exitSwing * 0.45));
+    }
+
+    let smoothed = Float64Array.from(rawOffset);
+    for (let pass = 0; pass < 12; pass++) {
+      const nextArr = new Float64Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        const a = smoothed[(i - 1 + sampleCount) % sampleCount];
+        const b = smoothed[i];
+        const c = smoothed[(i + 1) % sampleCount];
+        nextArr[i] = a * 0.25 + b * 0.5 + c * 0.25;
+      }
+      smoothed = nextArr;
+    }
+
+    for (let i = 0; i < sampleCount; i++) {
+      samples[i].racingOffset = smoothed[i];
+    }
+
+    // Compute dynamic racing line brakeIntensity (0=green, 0.5=yellow, 1=red)
+    // Based on how much a top-speed car must decelerate for upcoming curvature
+    const maxStraightSpeed = 70;
+    const rawBrake = new Float64Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) {
+      let maxBrakeDemand = 0;
+      // Scan ahead up to 110m
+      for (let step = 0; step <= 55; step += 2) {
+        const idxAhead = (i + step) % sampleCount;
+        const dist = step * ds;
+        const absK = Math.abs(samples[idxAhead].kappa);
+        if (absK > 0.008) {
+          const latBudget = absK > 0.022 ? 15.8 : 19.5;
+          const cornerSpeed = Math.sqrt(latBudget / absK);
+          const safeApproach = Math.sqrt(cornerSpeed * cornerSpeed + 2 * 22.0 * dist);
+          if (safeApproach < maxStraightSpeed) {
+            const demand = Math.min(1, (maxStraightSpeed - safeApproach) / 34);
+            if (demand > maxBrakeDemand) maxBrakeDemand = demand;
+          }
+        }
+      }
+      rawBrake[i] = maxBrakeDemand;
+    }
+
+    // Smooth brakeIntensity for gradual Green -> Yellow -> Red transitions
+    let smoothBrake = Float64Array.from(rawBrake);
+    for (let pass = 0; pass < 6; pass++) {
+      const nextArr = new Float64Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        const a = smoothBrake[(i - 1 + sampleCount) % sampleCount];
+        const b = smoothBrake[i];
+        const c = smoothBrake[(i + 1) % sampleCount];
+        nextArr[i] = a * 0.25 + b * 0.5 + c * 0.25;
+      }
+      smoothBrake = nextArr;
+    }
+    for (let i = 0; i < sampleCount; i++) {
+      samples[i].brakeIntensity = Math.max(0, Math.min(1, smoothBrake[i]));
+    }
+
+    this.samples = samples;
+
+    // Identify major corners by local curvature peaks for corner signage & braking boards
+    this.corners = this.detectCornerMarkers();
   }
-  for (let i = 0; i < sampleCount; i++) {
-    samples[i].curvature = smoothCurv[i];
-    samples[i].racingOffset = buf[i];
+
+  private detectCornerMarkers(): CornerMarker[] {
+    const markers: CornerMarker[] = [];
+    const minGapS = 85;
+    let cornerNum = 1;
+
+    // Find curvature peaks
+    const peaks: Array<{ idx: number; absK: number; dir: number }> = [];
+    for (let i = 0; i < this.count; i++) {
+      const k = this.samples[i].kappa;
+      const ak = Math.abs(k);
+      if (ak < 0.012) continue;
+      const prev = Math.abs(this.samples[(i - 2 + this.count) % this.count].kappa);
+      const next = Math.abs(this.samples[(i + 2) % this.count].kappa);
+      if (ak >= prev && ak >= next) {
+        peaks.push({ idx: i, absK: ak, dir: k >= 0 ? 1 : -1 });
+      }
+    }
+
+    // Filter out peaks too close to each other (keep strongest)
+    const chosen: Array<{ idx: number; absK: number; dir: number }> = [];
+    for (const p of peaks) {
+      const s = this.samples[p.idx].s;
+      const tooClose = chosen.find((c) => {
+        const cs = this.samples[c.idx].s;
+        const d = Math.min(Math.abs(s - cs), this.totalLength - Math.abs(s - cs));
+        return d < minGapS;
+      });
+      if (!tooClose) {
+        chosen.push(p);
+      } else if (p.absK > tooClose.absK) {
+        tooClose.idx = p.idx;
+        tooClose.absK = p.absK;
+        tooClose.dir = p.dir;
+      }
+    }
+
+    chosen.sort((a, b) => a.idx - b.idx);
+    for (const c of chosen) {
+      const isHairpin = c.absK > 0.026;
+      markers.push({
+        cornerNumber: cornerNum,
+        label: isHairpin ? `T${cornerNum} HAIRPIN` : `T${cornerNum}`,
+        apexS: this.samples[c.idx].s,
+        turnDir: c.dir,
+        hasBrakingBoards: c.absK > 0.015,
+      });
+      cornerNum++;
+    }
+    return markers;
   }
 
-  const finalTotalLength =
-    accS + Math.hypot(samples[0].x - samples[sampleCount - 1].x, samples[0].z - samples[sampleCount - 1].z);
+  sampleAtS(s: number): TrackSample {
+    const wrapped = ((s % this.totalLength) + this.totalLength) % this.totalLength;
+    const fIdx = (wrapped / this.totalLength) * this.count;
+    const i0 = Math.floor(fIdx) % this.count;
+    const i1 = (i0 + 1) % this.count;
+    const t = fIdx - Math.floor(fIdx);
+    const a = this.samples[i0];
+    const b = this.samples[i1];
+    const tx = a.tx + (b.tx - a.tx) * t;
+    const tz = a.tz + (b.tz - a.tz) * t;
+    const len = Math.hypot(tx, tz) || 1;
+    const utx = tx / len;
+    const utz = tz / len;
+    return {
+      s: wrapped,
+      x: a.x + (b.x - a.x) * t,
+      z: a.z + (b.z - a.z) * t,
+      tx: utx,
+      tz: utz,
+      nx: -utz,
+      nz: utx,
+      kappa: a.kappa + (b.kappa - a.kappa) * t,
+      racingOffset: a.racingOffset + (b.racingOffset - a.racingOffset) * t,
+      brakeIntensity: a.brakeIntensity + (b.brakeIntensity - a.brakeIntensity) * t,
+    };
+  }
 
-  const wrapS = (s: number): number => {
-    const r = s % finalTotalLength;
-    return r < 0 ? r + finalTotalLength : r;
-  };
-
-  const sampleAtS = (s: number): TrackSample => {
-    const ws = wrapS(s);
-    const approxIdx = Math.floor((ws / finalTotalLength) * sampleCount) % sampleCount;
-    return samples[approxIdx];
-  };
-
-  const projectPoint = (x: number, z: number, hintIndex?: number): TrackProjection => {
+  project(x: number, z: number, hintIdx?: number): TrackProjection {
     let bestIdx = 0;
     let bestDistSq = Infinity;
 
-    if (hintIndex !== undefined && hintIndex >= 0 && hintIndex < sampleCount) {
-      // Search local window ±36 samples first
-      for (let offset = -36; offset <= 36; offset++) {
-        const idx = (hintIndex + offset + sampleCount) % sampleCount;
-        const smp = samples[idx];
-        const dx = x - smp.x;
-        const dz = z - smp.z;
-        const dSq = dx * dx + dz * dz;
-        if (dSq < bestDistSq) {
-          bestDistSq = dSq;
-          bestIdx = idx;
-        }
-      }
-    }
-
-    // Fallback global search if hint wasn't given or car is far from hint
-    if (bestDistSq > 900) {
-      bestDistSq = Infinity;
-      for (let i = 0; i < sampleCount; i++) {
-        const smp = samples[i];
-        const dx = x - smp.x;
-        const dz = z - smp.z;
-        const dSq = dx * dx + dz * dz;
-        if (dSq < bestDistSq) {
-          bestDistSq = dSq;
+    if (hintIdx !== undefined && hintIdx >= 0 && hintIdx < this.count) {
+      const searchSpan = 32;
+      for (let off = -searchSpan; off <= searchSpan; off++) {
+        const i = (hintIdx + off + this.count) % this.count;
+        const sp = this.samples[i];
+        const dx = x - sp.x;
+        const dz = z - sp.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestDistSq) {
+          bestDistSq = d2;
           bestIdx = i;
         }
       }
     }
 
-    const s0 = samples[bestIdx];
-    const sPrev = samples[(bestIdx - 1 + sampleCount) % sampleCount];
-    const sNext = samples[(bestIdx + 1) % sampleCount];
+    if (bestDistSq > 900 || hintIdx === undefined) {
+      bestDistSq = Infinity;
+      for (let i = 0; i < this.count; i++) {
+        const sp = this.samples[i];
+        const dx = x - sp.x;
+        const dz = z - sp.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestDistSq) {
+          bestDistSq = d2;
+          bestIdx = i;
+        }
+      }
+    }
 
-    // Refine projection along local segment (sPrev -> sNext)
-    const dx = x - s0.x;
-    const dz = z - s0.z;
-    const along = dx * s0.tx + dz * s0.tz;
-    const segLen = Math.hypot(sNext.x - sPrev.x, sNext.z - sPrev.z) * 0.5 || 1;
-    const frac = Math.max(-1, Math.min(1, along / segLen));
-
-    const cx = s0.x + s0.tx * along;
-    const cz = s0.z + s0.tz * along;
-    const lateral = (x - cx) * s0.rx + (z - cz) * s0.rz;
-
-    let sVal = s0.s + frac * segLen;
-    sVal = wrapS(sVal);
+    const sp = this.samples[bestIdx];
+    const dx = x - sp.x;
+    const dz = z - sp.z;
+    const along = dx * sp.tx + dz * sp.tz;
+    const exactS = ((sp.s + along) % this.totalLength + this.totalLength) % this.totalLength;
+    const interp = this.sampleAtS(exactS);
+    const rx = x - interp.x;
+    const rz = z - interp.z;
+    const d = rx * interp.nx + rz * interp.nz;
 
     return {
-      sampleIndex: bestIdx,
-      s: sVal,
-      lateral,
-      tx: s0.tx,
-      tz: s0.tz,
-      rx: s0.rx,
-      rz: s0.rz,
-      cx,
-      cz,
-      curvature: s0.curvature,
-      racingOffset: s0.racingOffset,
+      idx: bestIdx,
+      s: exactS,
+      d,
+      x: interp.x,
+      z: interp.z,
+      tx: interp.tx,
+      tz: interp.tz,
+      nx: interp.nx,
+      nz: interp.nz,
+      kappa: interp.kappa,
+      racingOffset: interp.racingOffset,
     };
-  };
-
-  // Sanity guard against unused variable warning
-  void totalRawLength;
-
-  return {
-    samples,
-    totalLength: finalTotalLength,
-    roadHalfWidth: ROAD_HALF_WIDTH,
-    kerbWidth: KERB_WIDTH,
-    barrierHalfWidth: BARRIER_HALF_WIDTH,
-    minX,
-    maxX,
-    minZ,
-    maxZ,
-    sampleAtS,
-    projectPoint,
-    wrapS,
-  };
+  }
 }
 
-export const CIRCUIT: CircuitTrack = buildCircuit();
+export const DEFAULT_CAR_SPECS: CarSpec[] = [
+  {
+    index: 0,
+    number: '00',
+    name: 'PLAYER',
+    colorHex: '#06b6d4',
+    secondaryHex: '#f8fafc',
+    colorNum: 0x06b6d4,
+    accentNum: 0xf8fafc,
+    symbol: 'diamond',
+    personality: 'balanced',
+    isPlayer: true,
+    baseSkill: 1.0,
+    aggression: 0.78,
+    mistakeRate: 0.0,
+    straightBoost: 1.0,
+    cornerGripSkill: 1.0,
+    cornerCaution: 1.0,
+  },
+  {
+    index: 1,
+    number: '07',
+    name: 'RAZOR',
+    colorHex: '#ef4444',
+    secondaryHex: '#111827',
+    colorNum: 0xef4444,
+    accentNum: 0x111827,
+    symbol: 'chevron',
+    personality: 'aggressive',
+    isPlayer: false,
+    baseSkill: 0.985,
+    aggression: 0.96,
+    mistakeRate: 0.24,
+    straightBoost: 1.01,
+    cornerGripSkill: 1.0,
+    cornerCaution: 0.96,
+  },
+  {
+    index: 2,
+    number: '12',
+    name: 'BLAZE',
+    colorHex: '#eab308',
+    secondaryHex: '#111827',
+    colorNum: 0xeab308,
+    accentNum: 0x111827,
+    symbol: 'bolt',
+    personality: 'speedster',
+    isPlayer: false,
+    baseSkill: 0.975,
+    aggression: 0.72,
+    mistakeRate: 0.22,
+    straightBoost: 1.055,
+    cornerGripSkill: 0.96,
+    cornerCaution: 1.05,
+  },
+  {
+    index: 3,
+    number: '18',
+    name: 'MOSS',
+    colorHex: '#84cc16',
+    secondaryHex: '#1e293b',
+    colorNum: 0x84cc16,
+    accentNum: 0x1e293b,
+    symbol: 'shield',
+    personality: 'defensive',
+    isPlayer: false,
+    baseSkill: 0.955,
+    aggression: 0.45,
+    mistakeRate: 0.14,
+    straightBoost: 0.98,
+    cornerGripSkill: 0.99,
+    cornerCaution: 1.08,
+  },
+  {
+    index: 4,
+    number: '23',
+    name: 'NOVA',
+    colorHex: '#9333ea',
+    secondaryHex: '#111827',
+    colorNum: 0x9333ea,
+    accentNum: 0x111827,
+    symbol: 'star',
+    personality: 'cornering',
+    isPlayer: false,
+    baseSkill: 0.968,
+    aggression: 0.62,
+    mistakeRate: 0.1,
+    straightBoost: 0.965,
+    cornerGripSkill: 1.06,
+    cornerCaution: 0.94,
+  },
+  {
+    index: 5,
+    number: '31',
+    name: 'COMET',
+    colorHex: '#f97316',
+    secondaryHex: '#111827',
+    colorNum: 0xf97316,
+    accentNum: 0x111827,
+    symbol: 'comet',
+    personality: 'opportunistic',
+    isPlayer: false,
+    baseSkill: 0.945,
+    aggression: 0.84,
+    mistakeRate: 0.28,
+    straightBoost: 1.0,
+    cornerGripSkill: 0.98,
+    cornerCaution: 1.0,
+  },
+];

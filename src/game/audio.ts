@@ -1,36 +1,43 @@
-/**
- * Zero-asset procedural Web Audio synthesizer for engine RPM, tyre screech,
- * countdown tones, and collision impacts.
- */
-export class RacingAudio {
+export class RaceAudio {
   private ctx: AudioContext | null = null;
-  private engineOsc: OscillatorNode | null = null;
-  private engineSubOsc: OscillatorNode | null = null;
+  private masterGain: GainNode | null = null;
+  private engineOsc1: OscillatorNode | null = null;
+  private engineOsc2: OscillatorNode | null = null;
+  private engineFilter: BiquadFilterNode | null = null;
   private engineGain: GainNode | null = null;
   private screechGain: GainNode | null = null;
+  private screechFilter: BiquadFilterNode | null = null;
   private muted = false;
-  private started = false;
+  private initialized = false;
 
-  unlock(): void {
-    if (this.started) {
+  init(): void {
+    if (this.initialized) {
       if (this.ctx && this.ctx.state === 'suspended') {
         this.ctx.resume().catch(() => {});
       }
       return;
     }
+
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+
     try {
-      const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AC) return;
-      const ctx = new AC();
+      const ctx = new AudioCtx();
       this.ctx = ctx;
+      this.initialized = true;
 
-      // Engine harmonic oscillator + sub-harmonic
-      const filter = ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.value = 380;
+      const master = ctx.createGain();
+      master.gain.value = this.muted ? 0 : 0.35;
+      master.connect(ctx.destination);
+      this.masterGain = master;
 
-      const engineGain = ctx.createGain();
-      engineGain.gain.value = 0;
+      const engFilter = ctx.createBiquadFilter();
+      engFilter.type = 'lowpass';
+      engFilter.frequency.value = 280;
+      engFilter.Q.value = 3.2;
+
+      const engGain = ctx.createGain();
+      engGain.gain.value = 0.0;
 
       const osc1 = ctx.createOscillator();
       osc1.type = 'sawtooth';
@@ -38,53 +45,56 @@ export class RacingAudio {
 
       const osc2 = ctx.createOscillator();
       osc2.type = 'triangle';
-      osc2.frequency.value = 32.5;
+      osc2.frequency.value = 130;
 
-      osc1.connect(filter);
-      osc2.connect(filter);
-      filter.connect(engineGain);
-      engineGain.connect(ctx.destination);
+      osc1.connect(engFilter);
+      osc2.connect(engFilter);
+      engFilter.connect(engGain);
+      engGain.connect(master);
+
       osc1.start();
       osc2.start();
 
-      // Bandpass filtered white noise for tyre drift screech
-      const bufSize = ctx.sampleRate * 1.5;
+      this.engineOsc1 = osc1;
+      this.engineOsc2 = osc2;
+      this.engineFilter = engFilter;
+      this.engineGain = engGain;
+
+      const bufSize = ctx.sampleRate * 2;
       const noiseBuf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
       const data = noiseBuf.getChannelData(0);
       for (let i = 0; i < bufSize; i++) {
         data[i] = Math.random() * 2 - 1;
       }
+
       const noiseSrc = ctx.createBufferSource();
       noiseSrc.buffer = noiseBuf;
       noiseSrc.loop = true;
 
-      const bp = ctx.createBiquadFilter();
-      bp.type = 'bandpass';
-      bp.frequency.value = 1450;
-      bp.Q.value = 4.2;
+      const sFilter = ctx.createBiquadFilter();
+      sFilter.type = 'bandpass';
+      sFilter.frequency.value = 1450;
+      sFilter.Q.value = 4.5;
 
-      const screechGain = ctx.createGain();
-      screechGain.gain.value = 0;
+      const sGain = ctx.createGain();
+      sGain.gain.value = 0;
 
-      noiseSrc.connect(bp);
-      bp.connect(screechGain);
-      screechGain.connect(ctx.destination);
+      noiseSrc.connect(sFilter);
+      sFilter.connect(sGain);
+      sGain.connect(master);
       noiseSrc.start();
 
-      this.engineOsc = osc1;
-      this.engineSubOsc = osc2;
-      this.engineGain = engineGain;
-      this.screechGain = screechGain;
-      this.started = true;
+      this.screechFilter = sFilter;
+      this.screechGain = sGain;
     } catch {
-      // Ignore Web Audio errors in headless environments
+      // Ignore audio init errors
     }
   }
 
-  setMuted(muted: boolean): void {
-    this.muted = muted;
-    if (muted) {
-      this.silenceLoops();
+  setMuted(mute: boolean): void {
+    this.muted = mute;
+    if (this.masterGain && this.ctx) {
+      this.masterGain.gain.setTargetAtTime(mute ? 0 : 0.35, this.ctx.currentTime, 0.04);
     }
   }
 
@@ -94,75 +104,142 @@ export class RacingAudio {
 
   silenceLoops(): void {
     if (!this.ctx || !this.engineGain || !this.screechGain) return;
-    const now = this.ctx.currentTime;
-    this.engineGain.gain.setTargetAtTime(0, now, 0.04);
-    this.screechGain.gain.setTargetAtTime(0, now, 0.04);
+    const t = this.ctx.currentTime;
+    this.engineGain.gain.setTargetAtTime(0, t, 0.05);
+    this.screechGain.gain.setTargetAtTime(0, t, 0.04);
   }
 
-  update(speedKmh: number, throttle: number, driftIntensity: number, active: boolean): void {
-    if (!this.ctx || !this.engineOsc || !this.engineSubOsc || !this.engineGain || !this.screechGain) return;
-    const now = this.ctx.currentTime;
-    if (this.muted || !active) {
-      this.engineGain.gain.setTargetAtTime(0, now, 0.05);
-      this.screechGain.gain.setTargetAtTime(0, now, 0.05);
+  updateEngine(speedMs: number, throttle: number, driftIntensity: number, isBoosting: boolean, active: boolean): void {
+    if (!this.ctx || !this.engineOsc1 || !this.engineOsc2 || !this.engineFilter || !this.engineGain || !this.screechGain || !this.screechFilter) {
+      return;
+    }
+    const t = this.ctx.currentTime;
+    if (!active || this.muted) {
+      this.engineGain.gain.setTargetAtTime(0, t, 0.06);
+      this.screechGain.gain.setTargetAtTime(0, t, 0.04);
       return;
     }
 
-    // Simulated 5-speed gearbox RPM curve
-    const normSpeed = Math.min(1, speedKmh / 250);
-    const gearSaw = (normSpeed * 4.2) % 1;
-    const rpm = 0.25 + 0.55 * gearSaw + 0.2 * normSpeed + throttle * 0.14;
-    const freq = 52 + rpm * 135;
+    const absSpeed = Math.abs(speedMs);
+    const norm = Math.min(1, absSpeed / 78);
+    const gear = Math.min(5, Math.floor(norm * 6));
+    const gearMin = gear / 6;
+    const gearRpm = (norm - gearMin) * 6;
+    const boostPitch = isBoosting ? 34 : 0;
+    const baseHz = 52 + gearRpm * 92 + norm * 48 + throttle * 16 + boostPitch;
 
-    this.engineOsc.frequency.setTargetAtTime(freq, now, 0.04);
-    this.engineSubOsc.frequency.setTargetAtTime(freq * 0.5, now, 0.04);
-    this.engineGain.gain.setTargetAtTime(0.045 + throttle * 0.035, now, 0.05);
+    this.engineOsc1.frequency.setTargetAtTime(baseHz, t, 0.04);
+    this.engineOsc2.frequency.setTargetAtTime(baseHz * 2.01, t, 0.04);
+    this.engineFilter.frequency.setTargetAtTime(220 + baseHz * 3.8 + (isBoosting ? 420 : throttle * 320), t, 0.05);
+    this.engineGain.gain.setTargetAtTime(0.11 + (isBoosting ? 0.13 : throttle * 0.09), t, 0.06);
 
-    const screechVol = driftIntensity > 0.12 ? Math.min(0.075, driftIntensity * 0.075) : 0;
-    this.screechGain.gain.setTargetAtTime(screechVol, now, 0.04);
+    const screechVol = driftIntensity > 0.08 ? Math.min(0.22, driftIntensity * 0.22) : 0;
+    this.screechGain.gain.setTargetAtTime(screechVol, t, 0.03);
+    this.screechFilter.frequency.setTargetAtTime(1250 + driftIntensity * 550, t, 0.05);
   }
 
-  playBeep(high: boolean): void {
-    if (this.muted || !this.ctx) return;
-    try {
-      const now = this.ctx.currentTime;
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = high ? 880 : 440;
-      gain.gain.setValueAtTime(0.09, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + (high ? 0.32 : 0.16));
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.35);
-    } catch {
-      // Ignore
-    }
+  playCountdownBeep(isGo: boolean): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = isGo ? 'triangle' : 'sine';
+    osc.frequency.setValueAtTime(isGo ? 880 : 440, t);
+    g.gain.setValueAtTime(0.26, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + (isGo ? 0.45 : 0.22));
+    osc.connect(g);
+    g.connect(this.masterGain);
+    osc.start(t);
+    osc.stop(t + (isGo ? 0.48 : 0.25));
   }
 
   playImpact(intensity: number): void {
-    if (this.muted || !this.ctx || intensity < 0.08) return;
-    try {
-      const now = this.ctx.currentTime;
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(115 + intensity * 40, t);
+    osc.frequency.exponentialRampToValueAtTime(34, t + 0.16);
+    g.gain.setValueAtTime(Math.min(0.38, 0.12 + intensity * 0.26), t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    osc.connect(g);
+    g.connect(this.masterGain);
+    osc.start(t);
+    osc.stop(t + 0.2);
+  }
+
+  playNitroIgnite(): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(160, t);
+    osc.frequency.exponentialRampToValueAtTime(520, t + 0.18);
+    g.gain.setValueAtTime(0.2, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    osc.connect(g);
+    g.connect(this.masterGain);
+    osc.start(t);
+    osc.stop(t + 0.24);
+  }
+
+  playDriftBank(combo: number): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    const base = 523.25 + combo * 65;
+    [base, base * 1.25].forEach((freq, i) => {
+      if (!this.ctx || !this.masterGain) return;
       const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
+      const g = this.ctx.createGain();
       osc.type = 'triangle';
-      osc.frequency.setValueAtTime(115, now);
-      osc.frequency.exponentialRampToValueAtTime(36, now + 0.14);
-      gain.gain.setValueAtTime(Math.min(0.18, intensity * 0.16), now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.16);
-    } catch {
-      // Ignore
-    }
+      osc.frequency.setValueAtTime(freq, t + i * 0.06);
+      g.gain.setValueAtTime(0.16, t + i * 0.06);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.06 + 0.22);
+      osc.connect(g);
+      g.connect(this.masterGain);
+      osc.start(t + i * 0.06);
+      osc.stop(t + i * 0.06 + 0.24);
+    });
+  }
+
+  playOvertake(): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(440, t);
+    osc.frequency.exponentialRampToValueAtTime(784, t + 0.16);
+    g.gain.setValueAtTime(0.16, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    osc.connect(g);
+    g.connect(this.masterGain);
+    osc.start(t);
+    osc.stop(t + 0.22);
+  }
+
+  playLapChime(isFinal: boolean): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    const notes = isFinal ? [523.25, 659.25, 783.99, 1046.5] : [587.33, 880];
+    notes.forEach((freq, idx) => {
+      if (!this.ctx || !this.masterGain) return;
+      const t = this.ctx.currentTime + idx * 0.09;
+      const osc = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, t);
+      g.gain.setValueAtTime(0.2, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
+      osc.connect(g);
+      g.connect(this.masterGain);
+      osc.start(t);
+      osc.stop(t + 0.3);
+    });
   }
 
   dispose(): void {
-    this.silenceLoops();
     if (this.ctx) {
       this.ctx.close().catch(() => {});
       this.ctx = null;

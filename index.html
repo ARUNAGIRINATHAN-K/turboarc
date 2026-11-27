@@ -3,12 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Apex Circuit — 3D Arcade Car Racing</title>
-    <meta name="description" content="3D arcade car racing circuit with 6 cars, drift physics, AI rivals, chase and cockpit cameras." />
-    <meta property="og:title" content="Apex Circuit — 3D Arcade Car Racing" />
-    <meta property="og:description" content="3D arcade car racing circuit with 6 cars, drift physics, AI rivals, chase and cockpit cameras." />
+    <title>Apex Circuit — 3D Arcade Racing</title>
+    <meta name="description" content="3D arcade car racing game with drifting, AI opponents, chase and cockpit cameras, and deterministic benchmarking." />
+    <meta property="og:title" content="Apex Circuit — 3D Arcade Racing" />
+    <meta property="og:description" content="3D arcade car racing game with drifting, AI opponents, chase and cockpit cameras, and deterministic benchmarking." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      if (!window.location.pathname.endsWith('/racing.html')) {
+        window.location.replace('/racing.html' + window.location.search + window.location.hash);
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

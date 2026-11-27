@@ -1,142 +1,163 @@
-import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  createCarAtGrid,
-  resetCarToTrack,
-  resolveBarrierCollision,
-  resolveCarCollisions,
-  stepCarPhysics,
-} from './physics';
-import { FIXED_DT, RaceSimulation, runBenchRace, TOTAL_LAPS } from './sim';
-import { CIRCUIT } from './track';
+import assert from 'node:assert/strict';
+import { BARRIER_HALF_WIDTH, CircuitTrack, DEFAULT_CAR_SPECS } from './track';
+import { CAR_RADIUS, CIRCLE_RADIUS, stepCarPhysics } from './physics';
+import { createRaceState, FIXED_DT, runHeadlessRace, stepRace } from './race';
+import { SeededRNG } from './prng';
+import { InputState, SimEvent } from './types';
 
-test('circuit geometry is closed, non-self-intersecting, and has a tight hairpin', () => {
-  const n = CIRCUIT.samples.length;
-  assert.ok(n >= 400, 'Circuit should have dense samples');
-  assert.ok(CIRCUIT.totalLength > 900 && CIRCUIT.totalLength < 3000, `Unexpected length: ${CIRCUIT.totalLength}`);
+test('CircuitTrack is closed, non-self-intersecting, and includes straights, sweepers, hairpin, and corner markers', () => {
+  const track = new CircuitTrack();
+  assert.ok(track.totalLength > 900);
 
-  // Check closure
-  const first = CIRCUIT.samples[0];
-  const last = CIRCUIT.samples[n - 1];
-  const closureDist = Math.hypot(first.x - last.x, first.z - last.z);
-  assert.ok(closureDist < 5.0, `Closure gap too large: ${closureDist}`);
+  const first = track.samples[0];
+  const last = track.samples[track.samples.length - 1];
+  assert.ok(Math.hypot(first.x - last.x, first.z - last.z) < 5);
 
-  // Check non-adjacent centerline separation (> 34m so barriers & stands never overlap)
-  let minNonAdjDist = Infinity;
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 45; j < n - 45; j++) {
-      const a = CIRCUIT.samples[i];
-      const b = CIRCUIT.samples[j];
-      const d = Math.hypot(a.x - b.x, a.z - b.z);
-      if (d < minNonAdjDist) minNonAdjDist = d;
+  const minClearance = BARRIER_HALF_WIDTH * 2;
+  for (let i = 0; i < track.count; i++) {
+    for (let j = i + 22; j < track.count; j++) {
+      if (track.count - j + i < 22) continue;
+      const a = track.samples[i];
+      const b = track.samples[j];
+      assert.ok(Math.hypot(a.x - b.x, a.z - b.z) > minClearance);
     }
   }
-  assert.ok(
-    minNonAdjDist > 34,
-    `Track segments too close (potential self-intersection): minNonAdjDist=${minNonAdjDist.toFixed(2)}`
-  );
 
-  // Check tightest hairpin exists and radius of curvature >= 16m (safe for ±11.2m barriers)
-  let maxAbsCurv = 0;
-  for (const s of CIRCUIT.samples) {
-    maxAbsCurv = Math.max(maxAbsCurv, Math.abs(s.curvature));
+  let maxAbsKappa = 0;
+  let hasBrakingZone = false;
+  let hasGreenZone = false;
+  for (const s of track.samples) {
+    if (Math.abs(s.kappa) > maxAbsKappa) maxAbsKappa = Math.abs(s.kappa);
+    if (s.brakeIntensity > 0.65) hasBrakingZone = true;
+    if (s.brakeIntensity < 0.1) hasGreenZone = true;
   }
-  const minRadius = 1 / maxAbsCurv;
-  assert.ok(maxAbsCurv > 0.02, `Track needs at least one tight hairpin; maxCurv=${maxAbsCurv}`);
-  assert.ok(minRadius > 15.5, `Corner radius too tight for barriers: minRadius=${minRadius.toFixed(2)}`);
+  assert.ok(maxAbsKappa > 0.025, 'Track must include a tight hairpin');
+  assert.ok(hasBrakingZone && hasGreenZone, 'Dynamic racing line must include green and red braking zones');
+  assert.ok(track.corners.length >= 4, 'Track should detect numbered corner markers');
 });
 
-test('car physics accelerates, brakes, drifts on Space, and resets cleanly', () => {
-  const car = createCarAtGrid(0);
-  // Accelerate for 3 seconds
-  for (let i = 0; i < 180; i++) {
-    stepCarPhysics(car, { throttle: 1, brake: 0, steer: 0, handbrake: false }, FIXED_DT);
-  }
-  assert.ok(car.speedKmh > 120, `Expected high speed after 3s accel, got ${car.speedKmh}`);
+test('Six unique Turbovex 2.0 cars have distinct numbers, names, colors, and personalities', () => {
+  assert.equal(DEFAULT_CAR_SPECS.length, 6);
+  const numbers = new Set(DEFAULT_CAR_SPECS.map((c) => c.number));
+  const names = new Set(DEFAULT_CAR_SPECS.map((c) => c.name));
+  const symbols = new Set(DEFAULT_CAR_SPECS.map((c) => c.symbol));
+  assert.equal(numbers.size, 6);
+  assert.equal(names.size, 6);
+  assert.equal(symbols.size, 6);
+  assert.equal(DEFAULT_CAR_SPECS[0].name, 'PLAYER');
+  assert.equal(DEFAULT_CAR_SPECS[0].number, '00');
+});
 
-  // Enter corner holding Space (handbrake drift)
+test('Drift combo scoring, nitro boost activation/lockout, barrier clamping, and reset work', () => {
+  const track = new CircuitTrack();
+  const state = createRaceState(1, track, false);
+  const car = state.cars[0];
+  const events: SimEvent[] = [];
+
+  // Position car at beginning of the long main straight (s=10..240)
+  const startSp = track.sampleAtS(10);
+  car.x = startSp.x;
+  car.z = startSp.z;
+  car.heading = Math.atan2(startSp.tz, startSp.tx);
+  car.trackIdx = Math.floor((10 / track.totalLength) * track.count);
+
+  // Accelerate straight
+  const gas: InputState = { throttle: 1, brake: 0, steer: 0, handbrake: false, nitro: false, resetPressed: false };
+  for (let i = 0; i < 110; i++) {
+    stepCarPhysics(car, gas, track, FIXED_DT, events, true);
+  }
+  const baseSpeed = car.forwardSpeed;
+  assert.ok(baseSpeed > 35);
+
+  // Activate Nitro boost
+  const initialNitro = car.nitro;
+  const boostInput: InputState = { throttle: 1, brake: 0, steer: 0, handbrake: false, nitro: true, resetPressed: false };
   for (let i = 0; i < 45; i++) {
-    stepCarPhysics(car, { throttle: 0.7, brake: 0, steer: 1, handbrake: true }, FIXED_DT);
+    stepCarPhysics(car, boostInput, track, FIXED_DT, events, true);
   }
-  assert.equal(car.isDrifting, true, 'Car should enter drift state when steering with handbrake at speed');
-  assert.ok(car.driftIntensity > 0.2, 'Drift intensity should build up');
+  assert.ok(car.forwardSpeed > baseSpeed + 8, `Nitro should boost speed (${baseSpeed.toFixed(1)} -> ${car.forwardSpeed.toFixed(1)})`);
+  assert.ok(car.nitro < initialNitro, 'Nitro should drain while boosting');
+  assert.ok(car.boostActivations >= 1);
 
-  // Brake to slow down
-  const speedBeforeBrake = car.speed;
-  for (let i = 0; i < 60; i++) {
-    stepCarPhysics(car, { throttle: 0, brake: 1, steer: 0, handbrake: false }, FIXED_DT);
+  // Drain nitro completely and verify lockout prevents instant flutter until recharged >= 15%
+  for (let i = 0; i < 180; i++) {
+    stepCarPhysics(car, boostInput, track, FIXED_DT, events, true);
   }
-  assert.ok(car.speed < speedBeforeBrake - 15, 'Braking should strongly reduce forward speed');
+  assert.equal(car.nitro, 0);
+  assert.equal(car.nitroLockedUntilRecharge, true);
+  stepCarPhysics(car, boostInput, track, FIXED_DT, events, true);
+  assert.equal(car.isBoosting, false, 'Cannot boost when nitro depleted below recharge threshold');
 
-  // Reset to track centerline
-  resetCarToTrack(car);
-  assert.equal(car.speed, 0);
-  assert.equal(car.lateral, 0);
+  // Re-center onto asphalt straight at 42 m/s before testing drift score & combo banking
+  const driftSp = track.sampleAtS(10);
+  car.x = driftSp.x;
+  car.z = driftSp.z;
+  car.heading = Math.atan2(driftSp.tz, driftSp.tx);
+  car.vx = driftSp.tx * 42;
+  car.vz = driftSp.tz * 42;
+  car.trackIdx = Math.floor((10 / track.totalLength) * track.count);
+  car.trackD = 0;
+  car.isOffTrack = false;
+
+  // Drift with Space + steer, then release cleanly to bank score & refill nitro
+  events.length = 0;
+  const driftInput: InputState = { throttle: 1, brake: 0, steer: 0.7, handbrake: true, nitro: false, resetPressed: false };
+  for (let i = 0; i < 40; i++) {
+    stepCarPhysics(car, driftInput, track, FIXED_DT, events, true);
+  }
+  assert.ok(car.currentDriftScore > 25, `Drifting should accumulate score, got ${car.currentDriftScore}`);
+  assert.ok(car.nitro > 0, 'Drifting should recharge nitro');
+  assert.ok(events.some((e) => e.type === 'skid'));
+  assert.ok(events.some((e) => e.type === 'smoke'));
+
+  // Release handbrake cleanly to bank drift score
+  for (let i = 0; i < 30; i++) {
+    stepCarPhysics(car, gas, track, FIXED_DT, events, true);
+  }
+  assert.ok(car.totalDriftScore > 0, 'Clean drift exit should bank drift score');
+  assert.ok(events.some((e) => e.type === 'drift_bank'));
+
+  // Barrier clamp
+  for (let i = 0; i < 180; i++) {
+    stepCarPhysics(car, { throttle: 1, brake: 0, steer: 0.5, handbrake: false, nitro: false, resetPressed: false }, track, FIXED_DT, events, true);
+    assert.ok(Math.abs(car.trackD) <= BARRIER_HALF_WIDTH - CAR_RADIUS + 0.01);
+  }
+
+  // Reset
+  stepCarPhysics(car, { throttle: 0, brake: 0, steer: 0, handbrake: false, nitro: false, resetPressed: true }, track, FIXED_DT, events, true);
+  assert.ok(Math.abs(car.trackD) < 0.01);
+  assert.equal(car.forwardSpeed, 0);
 });
 
-test('barrier collision keeps car strictly inside track bounds and counts hits', () => {
-  const car = createCarAtGrid(0);
-  const smp = CIRCUIT.sampleAtS(100);
-  // Place car far outside barrier moving outward
-  car.x = smp.x + smp.rx * 25;
-  car.z = smp.z + smp.rz * 25;
-  car.vx = smp.rx * 20;
-  car.vz = smp.rz * 20;
-  car.sampleIndex = smp.index;
-
-  const { projection, hitBarrier } = resolveBarrierCollision(car);
-  assert.equal(hitBarrier, true, 'Should register barrier hit');
-  assert.ok(
-    Math.abs(projection.lateral) <= CIRCUIT.barrierHalfWidth,
-    `Car escaped barrier: lateral=${projection.lateral}`
-  );
-});
-
-test('car-to-car collision separates overlapping cars', () => {
-  const a = createCarAtGrid(0);
-  const b = createCarAtGrid(1);
-  b.x = a.x + 0.5;
-  b.z = a.z + 0.2;
-  a.vx = 10;
-  b.vx = -10;
-
-  for (let pass = 0; pass < 4; pass++) {
-    resolveCarCollisions([a, b]);
+test('Cars collide with each other and never pass through', () => {
+  const track = new CircuitTrack();
+  const rng = new SeededRNG(7);
+  const state = createRaceState(7, track, true);
+  for (let s = 0; s < 25 * 60; s++) {
+    stepRace(state, track, rng, { throttle: 0, brake: 0, steer: 0, handbrake: false, nitro: false, resetPressed: false }, FIXED_DT);
+    for (let i = 0; i < state.cars.length; i++) {
+      for (let j = i + 1; j < state.cars.length; j++) {
+        const a = state.cars[i];
+        const b = state.cars[j];
+        assert.ok(Math.hypot(a.x - b.x, a.z - b.z) > CIRCLE_RADIUS * 1.5);
+      }
+    }
   }
-  const dist = Math.hypot(b.x - a.x, b.z - a.z);
-  assert.ok(dist >= 1.85, `Cars remained overlapping after collision: dist=${dist}`);
 });
 
-test('window.bench.race is deterministic by seed and completes 3-lap race with zero stuck cars', () => {
-  const r1 = runBenchRace(42, 135);
-  const r2 = runBenchRace(42, 135);
-
-  assert.deepEqual(r1, r2, 'Same seed must produce identical bench results');
+test('runHeadlessRace is deterministic across seeds, completes 3 laps, and has 0 stuck cars', () => {
+  const r1 = runHeadlessRace(42, 160);
+  const r2 = runHeadlessRace(42, 160);
+  assert.deepEqual(r1, r2);
   assert.equal(r1.laps.length, 6);
   assert.equal(r1.order.length, 6);
-  assert.deepEqual([...r1.order].sort((a, b) => a - b), [0, 1, 2, 3, 4, 5]);
-  assert.equal(r1.stuck, 0, `No cars should be stuck > 5s, got stuck=${r1.stuck}`);
-
+  assert.equal(new Set(r1.order).size, 6);
+  assert.equal(r1.stuck, 0);
   for (let i = 0; i < 6; i++) {
-    assert.equal(r1.laps[i], TOTAL_LAPS, `Car ${i} should complete ${TOTAL_LAPS} laps in 135s, got ${r1.laps[i]}`);
+    assert.ok(r1.laps[i] >= 3, `Car ${i} completed ${r1.laps[i]} laps`);
   }
 
-  // Different seeds should produce different race outcomes/timings
-  const r3 = runBenchRace(1234, 60);
-  assert.equal(r3.stuck, 0, 'Zero stuck cars on alternate seed');
-  assert.ok(r3.laps.every((l) => l >= 1), `All cars should complete >= 1 lap in 60s, got ${r3.laps}`);
-});
-
-test('RaceSimulation countdown transitions cleanly into racing', () => {
-  const sim = new RaceSimulation(7, true);
-  assert.equal(sim.phase, 'countdown');
-  assert.equal(sim.getCountdownDisplay(), 3);
-
-  for (let i = 0; i < 120; i++) sim.step(FIXED_DT); // 2.0s elapsed
-  assert.equal(sim.phase, 'countdown');
-  assert.equal(sim.getCountdownDisplay(), 1);
-
-  for (let i = 0; i < 65; i++) sim.step(FIXED_DT); // 3.08s elapsed
-  assert.equal(sim.phase, 'racing');
-  assert.ok(sim.cars[0].speed > 1, 'Cars should launch once countdown finishes');
+  const rSeed99 = runHeadlessRace(99, 160);
+  assert.equal(rSeed99.stuck, 0);
 });

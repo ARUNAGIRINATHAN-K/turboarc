@@ -1,37 +1,25 @@
-# 🏁 TURBOARC
+# Turbovex 2.0
 
-*One car. Five rivals. Three laps. Zero install.*
+A self contained 3D arcade racing game focused on accessible driving, competitive AI, and responsive race feedback.
 
-A 3D arcade racer that runs in your browser. Drift through the hairpins, outbrake the AI, and beat your best lap.
+## Features
 
-## ▶️ Play
+- Six uniquely identified cars and a three-lap race.
+- Racing-line guidance, drifting, scoring combos, and nitro boosts.
+- Race HUD with position, timing, speed, boost, and minimap.
+- Chase and cockpit cameras, pause menu, and race results.
+- Demo mode and deterministic seeded races.
+- Synchronous benchmark API: `window.bench.race(seed, seconds)`.
 
-Open `racing.html` in any modern browser. That's it. No install, no build step.
+## Controls
 
-## 🎮 Controls
+- **Arrow keys / WASD:** Drive and steer
+- **Space:** Handbrake drift
+- **Shift:** Activate nitro
+- **R:** Reset car
+- **C:** Switch camera
+- **Esc:** Pause
 
-| Key | Action |
-|---|---|
-| ↑ ↓ ← → or W A S D | Accelerate, brake, steer |
-| Space | Handbrake (hold it through a corner to drift) |
-| R | Reset onto the track |
-| C | Switch chase / cockpit camera |
+## Run
 
-## 🏆 The Race
-
-Three laps, six cars: you against five AI rivals who brake for corners, overtake, and sometimes make mistakes. Watch your position, lap times, and the minimap.
-
-## 🤖 Demo Mode
-
-Add `?demo=1` to the URL and watch an autopilot take the race. It restarts itself after the results.
-
-Add `?seed=42` (any number) to get the same race every time.
-
-## 🧪 Bench (for testing)
-
-```js
-window.bench.race(42, 120)
-// → { laps, order, barrierHits, stuck }
-```
-
-Runs a full race headless and returns the results instantly.
+Open `racing.html` in a browser. Add `?demo=1` for demo mode or `?seed=N` for a reproducible race.

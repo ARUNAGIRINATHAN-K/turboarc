@@ -1,219 +1,237 @@
-import { CarState, ControlInput } from './physics';
-import { SeededRNG } from './rng';
-import { CIRCUIT } from './track';
+import { SeededRNG } from './prng';
+import { normalizeAngle } from './physics';
+import { CircuitTrack, ROAD_HALF_WIDTH } from './track';
+import { CarState, InputState } from './types';
 
-export interface AIDriverProfile {
-  skillSpeedFactor: number;     // 0.94 .. 1.02
-  cornerBrakeCaution: number;   // higher = brakes earlier
-  lineAggression: number;       // 0.7 .. 1.1
-  mistakeTimer: number;         // countdown until next small mistake check
-  mistakeActiveTimer: number;   // active duration of small mistake
-  mistakeSteerBias: number;     // slight drift/wide-entry steering bias
-  mistakeThrottleScale: number; // brief lift or late brake
-  recoveryTimer: number;        // reverse-out timer if pinned
-  recoveryDir: number;
-  lowMoveTimer: number;
-  prevX: number;
-  prevZ: number;
-}
-
-export function createAIProfile(carId: number, rng: SeededRNG, isPlayerAutopilot: boolean): AIDriverProfile {
-  if (isPlayerAutopilot && carId === 0) {
-    return {
-      skillSpeedFactor: 1.0,
-      cornerBrakeCaution: 1.0,
-      lineAggression: 0.95,
-      mistakeTimer: 99999,
-      mistakeActiveTimer: 0,
-      mistakeSteerBias: 0,
-      mistakeThrottleScale: 1,
-      recoveryTimer: 0,
-      recoveryDir: 1,
-      lowMoveTimer: 0,
-      prevX: 0,
-      prevZ: 0,
-    };
-  }
-
-  // Spread 5 AI opponent paces naturally so racing pack stays competitive with overtakes
-  const baseSkill = 0.935 + (5 - carId) * 0.015 + rng.range(-0.01, 0.012);
-  return {
-    skillSpeedFactor: baseSkill,
-    cornerBrakeCaution: rng.range(0.92, 1.12),
-    lineAggression: rng.range(0.78, 1.05),
-    mistakeTimer: rng.range(7, 16),
-    mistakeActiveTimer: 0,
-    mistakeSteerBias: 0,
-    mistakeThrottleScale: 1,
-    recoveryTimer: 0,
-    recoveryDir: 1,
-    lowMoveTimer: 0,
-    prevX: 0,
-    prevZ: 0,
-  };
-}
-
-export function computeAIControl(
+/**
+ * AI / Autopilot with 6 distinct driving personalities:
+ * - balanced (00 PLAYER autopilot)
+ * - aggressive (07 RAZOR): widens overtake search & dives earlier
+ * - speedster (12 BLAZE): maximizes straight-line nitro & high exit speed
+ * - defensive (18 MOSS): protects inside line when trailed closely & brakes cautiously
+ * - cornering (23 NOVA): smooth apex hugging & higher cornering speed
+ * - opportunistic (31 COMET): tries alternate outside/inside passing lines
+ */
+export function computeAIInput(
   car: CarState,
-  allCars: ReadonlyArray<CarState>,
-  profile: AIDriverProfile,
+  allCars: CarState[],
+  track: CircuitTrack,
   rng: SeededRNG,
   dt: number,
-  isAutopilot: boolean,
   raceActive: boolean
-): ControlInput {
+): InputState {
   if (!raceActive) {
-    return { throttle: 0, brake: 0, steer: 0, handbrake: false };
-  }
-
-  // Anti-stuck recovery check: if car moves < 0.8m over 2.0s during active race, reverse & turn out
-  const moved = Math.hypot(car.x - profile.prevX, car.z - profile.prevZ);
-  if (moved > 1.2) {
-    profile.prevX = car.x;
-    profile.prevZ = car.z;
-    profile.lowMoveTimer = 0;
-  } else {
-    profile.lowMoveTimer += dt;
-    if (profile.lowMoveTimer > 1.8 && profile.recoveryTimer <= 0) {
-      profile.recoveryTimer = 0.85;
-      profile.recoveryDir = car.lateral > 0 ? -1 : 1;
-      profile.lowMoveTimer = 0;
-    }
-  }
-
-  if (profile.recoveryTimer > 0) {
-    profile.recoveryTimer -= dt;
     return {
       throttle: 0,
-      brake: 1,
-      steer: profile.recoveryDir,
+      brake: 0,
+      steer: 0,
       handbrake: false,
+      nitro: false,
+      resetPressed: false,
     };
   }
 
-  // Occasional small human-like mistakes for opponent AI cars (never for player autopilot)
-  if (!isAutopilot) {
-    if (profile.mistakeActiveTimer > 0) {
-      profile.mistakeActiveTimer -= dt;
-      if (profile.mistakeActiveTimer <= 0) {
-        profile.mistakeSteerBias = 0;
-        profile.mistakeThrottleScale = 1.0;
-      }
-    } else {
-      profile.mistakeTimer -= dt;
-      if (profile.mistakeTimer <= 0) {
-        profile.mistakeTimer = rng.range(9, 20);
-        // Only trigger a small mistake if safely inside the road (won't crash straight into a wall)
-        if (Math.abs(car.lateral) < 4.8 && car.speed > 20) {
-          profile.mistakeActiveTimer = rng.range(0.45, 0.85);
-          profile.mistakeSteerBias = rng.range(-0.16, 0.16);
-          profile.mistakeThrottleScale = rng.range(0.75, 0.92);
-        }
+  const speed = Math.hypot(car.vx, car.vz);
+
+  // 1. Stuck recovery check
+  if (speed < 2.4) {
+    car.aiRecoveryTimer += dt;
+  } else {
+    car.aiRecoveryTimer = Math.max(0, car.aiRecoveryTimer - dt * 2.5);
+  }
+
+  if (car.aiRecoveryTimer > 1.35) {
+    const proj = track.project(car.x, car.z, car.trackIdx);
+    const trackHeading = Math.atan2(proj.tz, proj.tx);
+    const headingErr = normalizeAngle(trackHeading - car.heading);
+
+    if (car.aiRecoveryTimer < 2.25) {
+      const steerDir = proj.d > 0 ? 1 : -1;
+      return {
+        throttle: 0,
+        brake: 1.0,
+        steer: headingErr > 0 ? -steerDir : steerDir,
+        handbrake: false,
+        nitro: false,
+        resetPressed: false,
+      };
+    } else if (car.aiRecoveryTimer > 3.6) {
+      car.aiRecoveryTimer = 0;
+      return {
+        throttle: 0,
+        brake: 0,
+        steer: 0,
+        handbrake: false,
+        nitro: false,
+        resetPressed: true,
+      };
+    }
+  }
+
+  // 2. Small periodic AI mistakes (disabled for player autopilot)
+  if (car.spec.mistakeRate > 0) {
+    car.aiNextMistakeCheck -= dt;
+    if (car.aiMistakeTimer > 0) {
+      car.aiMistakeTimer -= dt;
+    } else if (car.aiNextMistakeCheck <= 0) {
+      car.aiNextMistakeCheck = rng.range(4.8, 10.0);
+      if (rng.next() < car.spec.mistakeRate * 0.42) {
+        car.aiMistakeTimer = rng.range(0.32, 0.72);
+        car.aiMistakeSteer = rng.range(-0.20, 0.20);
+        car.aiMistakeBrake = rng.next() < 0.5 ? rng.range(0.15, 0.32) : 0;
+      } else {
+        car.aiMistakeSteer = 0;
+        car.aiMistakeBrake = 0;
       }
     }
   }
 
-  // 1. Overtake / traffic avoidance lane selection
+  // Opportunistic COMET occasionally explores alternate wide/inside line
+  if (car.spec.personality === 'opportunistic') {
+    car.aiAltLineTimer -= dt;
+    if (car.aiAltLineTimer <= 0) {
+      car.aiAltLineTimer = rng.range(3.5, 6.5);
+      car.aiAltLineBias = rng.next() < 0.45 ? rng.range(-3.2, 3.2) : 0;
+    }
+  }
+
+  // 3. Overtaking, Defensive Blocking & Traffic Avoidance
+  const overtakeScanDist = car.spec.personality === 'aggressive' ? 35 : 27;
   let overtakeOffset = 0;
-  let nearestAheadDist = Infinity;
-  let nearestAheadSpeed = 999;
+  let nearestAheadGap = Infinity;
+  let blockingCarSpeed = 999;
+  let defensiveBlockOffset: number | null = null;
 
   for (let i = 0; i < allCars.length; i++) {
+    if (i === car.index) continue;
     const other = allCars[i];
-    if (other.id === car.id) continue;
-    let ds = other.s - car.s;
-    if (ds < 0) ds += CIRCUIT.totalLength;
-    if (ds > 0.5 && ds < 26.0) {
-      const dLat = other.lateral - car.lateral;
-      if (Math.abs(dLat) < 3.4 && ds < nearestAheadDist) {
-        nearestAheadDist = ds;
-        nearestAheadSpeed = other.speed;
-        // Pick wider clear side within safe road half-width
-        const roomLeft = car.lateral + (CIRCUIT.roadHalfWidth - 2.0);
-        const roomRight = (CIRCUIT.roadHalfWidth - 2.0) - car.lateral;
-        if (dLat >= 0) {
-          overtakeOffset = roomLeft > 2.8 ? -3.4 : 3.2;
+
+    let ds = other.trackS - car.trackS;
+    if (ds < -track.totalLength * 0.5) ds += track.totalLength;
+    if (ds > track.totalLength * 0.5) ds -= track.totalLength;
+
+    // Car ahead
+    if (ds > 1.5 && ds < overtakeScanDist) {
+      const dd = other.trackD - car.trackD;
+      const laneCheck = car.spec.personality === 'aggressive' ? 4.1 : 3.6;
+      if (Math.abs(dd) < laneCheck && ds < nearestAheadGap) {
+        nearestAheadGap = ds;
+        blockingCarSpeed = Math.hypot(other.vx, other.vz);
+        const spaceRight = ROAD_HALF_WIDTH - 2.0 - other.trackD;
+        const spaceLeft = other.trackD - (-ROAD_HALF_WIDTH + 2.0);
+        const stepOut = car.spec.personality === 'aggressive' ? 4.2 : 3.8;
+        if (spaceRight > spaceLeft) {
+          overtakeOffset = Math.min(ROAD_HALF_WIDTH - 2.1, other.trackD + stepOut);
         } else {
-          overtakeOffset = roomRight > 2.8 ? 3.4 : -3.2;
+          overtakeOffset = Math.max(-ROAD_HALF_WIDTH + 2.1, other.trackD - stepOut);
         }
+      }
+    }
+    // Defensive MOSS protects inside/middle line if a rival is closing from behind
+    else if (
+      car.spec.personality === 'defensive' &&
+      ds < -2.0 &&
+      ds > -16 &&
+      nearestAheadGap >= overtakeScanDist
+    ) {
+      // Shift gently toward the side the trailing car is on (bounded cleanly)
+      defensiveBlockOffset = Math.max(-4.5, Math.min(4.5, other.trackD * 0.7));
+    }
+    // Side-by-side separation nudge
+    else if (Math.abs(ds) <= 4.2) {
+      const dd = other.trackD - car.trackD;
+      if (Math.abs(dd) < 2.8) {
+        overtakeOffset += dd > 0 ? -1.4 : 1.4;
       }
     }
   }
 
-  // 2. Lookahead target point along racing line
-  const lookDist = Math.max(13.5, Math.min(34, 11.0 + car.speed * 0.42));
-  const targetSample = CIRCUIT.sampleAtS(car.s + lookDist);
-  const desiredLat = Math.max(
-    -CIRCUIT.roadHalfWidth + 1.8,
-    Math.min(
-      CIRCUIT.roadHalfWidth - 1.8,
-      targetSample.racingOffset * profile.lineAggression + overtakeOffset
-    )
-  );
-
-  const tx = targetSample.x + targetSample.rx * desiredLat;
-  const tz = targetSample.z + targetSample.rz * desiredLat;
-
-  const dx = tx - car.x;
-  const dz = tz - car.z;
-  const desiredYaw = Math.atan2(dx, dz);
-
-  let yawErr = desiredYaw - car.yaw;
-  while (yawErr > Math.PI) yawErr -= Math.PI * 2;
-  while (yawErr < -Math.PI) yawErr += Math.PI * 2;
-
-  // Positive steer = turn right (which reduces yaw), so negative yawErr needs positive steer!
-  let steer = Math.max(-1, Math.min(1, (-yawErr * 2.1) + profile.mistakeSteerBias));
-
-  // 3. Corner braking lookahead (scan 18m..88m ahead for peak curvature)
-  let maxCurvature = Math.abs(CIRCUIT.sampleAtS(car.s + 10).curvature);
-  for (let d = 18; d <= 88; d += 10) {
-    const smp = CIRCUIT.sampleAtS(car.s + d);
-    // Weight closer corners higher so car brakes on entry and accelerates out of apex
-    const weight = d < 45 ? 1.0 : 0.85;
-    maxCurvature = Math.max(maxCurvature, Math.abs(smp.curvature) * weight);
+  const baseSample = track.sampleAtS(car.trackS + 16 + speed * 0.32);
+  let desiredLane = baseSample.racingOffset + car.aiAltLineBias;
+  if (nearestAheadGap < overtakeScanDist) {
+    desiredLane = overtakeOffset;
+  } else if (defensiveBlockOffset !== null) {
+    desiredLane = defensiveBlockOffset;
   }
 
-  // Max safe cornering speed from lateral acceleration envelope (~23.5 m/s^2 arcade GT grip)
-  const lateralAccelBudget = (23.5 / profile.cornerBrakeCaution) * (isAutopilot ? 1.04 : 1.0);
-  const cornerMaxSpeed =
-    maxCurvature > 0.0025
-      ? Math.sqrt(lateralAccelBudget / maxCurvature)
-      : car.spec.topSpeed;
+  desiredLane = Math.max(-ROAD_HALF_WIDTH + 1.8, Math.min(ROAD_HALF_WIDTH - 1.8, desiredLane));
+  car.aiTargetOffset = desiredLane;
+  const laneBlendRate = car.spec.personality === 'aggressive' ? 4.6 : 3.8;
+  car.aiLaneOffset += (car.aiTargetOffset - car.aiLaneOffset) * Math.min(1, laneBlendRate * dt);
 
-  let targetSpeed = Math.min(car.spec.topSpeed * profile.skillSpeedFactor, cornerMaxSpeed);
-  if (nearestAheadDist < 7.5 && Math.abs(overtakeOffset) < 1.0) {
-    targetSpeed = Math.min(targetSpeed, Math.max(12, nearestAheadSpeed * 0.92));
+  // 4. Lookahead Steering Target
+  const lookAheadDist = Math.max(12, Math.min(34, 11 + speed * 0.36));
+  const targetSample = track.sampleAtS(car.trackS + lookAheadDist);
+  const targetX = targetSample.x + targetSample.nx * car.aiLaneOffset;
+  const targetZ = targetSample.z + targetSample.nz * car.aiLaneOffset;
+
+  const desiredHeading = Math.atan2(targetZ - car.z, targetX - car.x);
+  let headingError = normalizeAngle(desiredHeading - car.heading);
+
+  if (car.aiMistakeTimer > 0) {
+    headingError += car.aiMistakeSteer;
   }
 
-  // Keep car safely away from outer barriers if lateral drift gets high
-  if (Math.abs(car.lateral) > CIRCUIT.roadHalfWidth - 0.5) {
-    targetSpeed = Math.min(targetSpeed, 32);
-    const centerBias = car.lateral > 0 ? -0.35 : 0.35;
-    steer = Math.max(-1, Math.min(1, steer + centerBias));
+  const steer = Math.max(-1, Math.min(1, headingError * 2.25));
+
+  // 5. Curvature Lookahead Speed Planning
+  let maxSafeSpeed = 74;
+  let minStraightAheadKappa = 0;
+  const scanDistances = [12, 24, 38, 54, 72, 92];
+  for (let i = 0; i < scanDistances.length; i++) {
+    const dist = scanDistances[i];
+    const ahead = track.sampleAtS(car.trackS + dist);
+    const absKappa = Math.abs(ahead.kappa);
+    if (absKappa > minStraightAheadKappa) minStraightAheadKappa = absKappa;
+    if (absKappa > 0.004) {
+      const latAccelBudget = (absKappa > 0.022 ? 15.8 : 19.5) * car.spec.cornerGripSkill / car.spec.cornerCaution;
+      const cornerSpeed = Math.sqrt(latAccelBudget / absKappa) * car.spec.baseSkill;
+      const brakeDecel = 24.0 / car.spec.cornerCaution;
+      const entrySpeed = Math.sqrt(cornerSpeed * cornerSpeed + 2 * brakeDecel * dist);
+      if (entrySpeed < maxSafeSpeed) {
+        maxSafeSpeed = entrySpeed;
+      }
+    }
   }
 
-  let throttle = 0;
-  let brake = 0;
-  if (car.speed > targetSpeed + 2.8) {
-    brake = Math.min(1, (car.speed - targetSpeed) / 14.0);
-  } else if (car.speed < targetSpeed) {
-    throttle = Math.min(1, 0.35 + (targetSpeed - car.speed) / 8.0) * profile.mistakeThrottleScale;
-  } else {
-    throttle = 0.4 * profile.mistakeThrottleScale;
+  if (nearestAheadGap < 8.5 && Math.abs(car.trackD - car.aiTargetOffset) < 1.2) {
+    maxSafeSpeed = Math.min(maxSafeSpeed, blockingCarSpeed + 3);
   }
 
-  // Finished cars cruise gently at steady pace
-  if (car.finished) {
-    targetSpeed = 24;
-    throttle = car.speed < targetSpeed ? 0.35 : 0;
-    brake = car.speed > targetSpeed + 4 ? 0.3 : 0;
+  let throttle = 1.0;
+  let brake = 0.0;
+
+  const speedDiff = speed - maxSafeSpeed;
+  if (speedDiff > 3.5) {
+    throttle = 0;
+    brake = Math.min(1, (speedDiff - 2.0) / 12.0);
+  } else if (speedDiff > 0.5) {
+    throttle = 0.25;
   }
+
+  if (Math.abs(headingError) > 0.48 && speed > 28) {
+    throttle = Math.min(throttle, 0.3);
+  }
+
+  if (car.aiMistakeTimer > 0 && car.aiMistakeBrake > 0) {
+    brake = Math.max(brake, car.aiMistakeBrake);
+    throttle *= 0.4;
+  }
+
+  // 6. Smart Nitro Usage on straights when clear & not braking
+  const straightClear = minStraightAheadKappa < 0.011 && Math.abs(headingError) < 0.16 && brake === 0;
+  const nitroThreshold = car.spec.personality === 'speedster' ? 28 : 45;
+  const wantNitro =
+    straightClear &&
+    speed > 26 &&
+    (car.isBoosting ? car.nitro > 4 : car.nitro >= nitroThreshold);
 
   return {
     throttle,
     brake,
     steer,
     handbrake: false,
+    nitro: wantNitro,
+    resetPressed: false,
   };
 }

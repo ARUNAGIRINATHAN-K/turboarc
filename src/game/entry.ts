@@ -2,7 +2,8 @@ import { RacingAudio } from './audio';
 import { ControlInput } from './physics';
 import { CameraMode, RacingRenderer3D } from './renderer3d';
 import { BenchRaceResult, FIXED_DT, RaceSimulation, runBenchRace } from './sim';
-import { GameScreenState, RACING_STYLES, RacingUI } from './ui';
+import { GameScreenState, GameSettings, RACING_STYLES, RacingUI } from './ui';
+import { CIRCUIT } from './track';
 
 declare global {
   interface Window {
@@ -21,7 +22,6 @@ export function installBenchGlobal(): void {
 export function mountRacingGame(hostElement: HTMLElement): () => void {
   installBenchGlobal();
 
-  // Inject self-contained stylesheet once
   let styleEl = document.getElementById('apex-racing-styles') as HTMLStyleElement | null;
   if (!styleEl) {
     styleEl = document.createElement('style');
@@ -36,6 +36,14 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
   const seedParam = params.get('seed');
   const parsedSeed = seedParam !== null && seedParam.trim() !== '' ? Number(seedParam) : NaN;
   const baseSeed = Number.isFinite(parsedSeed) ? Math.floor(parsedSeed) : 42;
+
+  const settings: GameSettings = {
+    racingLine: true,
+    cameraShake: true,
+    visualEffects: true,
+    touchControls: 'auto',
+    muted: false,
+  };
 
   const shell = document.createElement('div');
   shell.className = 'race-shell';
@@ -57,7 +65,24 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
   let lastTimestamp = performance.now();
   let disposed = false;
 
+  // Contextual first-race hints
+  let shownBrakeHint = false;
+  let shownDriftHint = false;
+  let shownNitroHint = false;
+
   const keysHeld = new Set<string>();
+
+  const applySettingsToSubsystems = (next: GameSettings) => {
+    settings.racingLine = next.racingLine;
+    settings.cameraShake = next.cameraShake;
+    settings.visualEffects = next.visualEffects;
+    settings.touchControls = next.touchControls;
+    settings.muted = next.muted;
+    renderer3d.setRacingLineVisible(next.racingLine);
+    renderer3d.cameraShakeEnabled = next.cameraShake;
+    renderer3d.fxEnabled = next.visualEffects;
+    audio.setMuted(next.muted);
+  };
 
   const startRace = (newSeed?: number) => {
     audio.unlock();
@@ -72,6 +97,7 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
       renderer3d.cameraMode = 'chase';
     }
     ui.setCameraLabel(renderer3d.cameraMode);
+    ui.setContextHint('');
     screenState = 'playing';
     ui.setScreenState(screenState, isDemo);
     keysHeld.clear();
@@ -84,6 +110,10 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
   };
 
   const togglePause = () => {
+    if (ui.hasSubModalOpen()) {
+      ui.closeSubModals();
+      return;
+    }
     if (screenState === 'playing') {
       screenState = 'paused';
       audio.silenceLoops();
@@ -98,11 +128,13 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
 
   const toggleMute = () => {
     audio.unlock();
-    audio.setMuted(!audio.isMuted());
-    ui.setMutedLabel(audio.isMuted());
+    const muted = !audio.isMuted();
+    audio.setMuted(muted);
+    settings.muted = muted;
+    ui.setMutedLabel(muted);
   };
 
-  const ui = new RacingUI(shell, {
+  const ui = new RacingUI(shell, settings, {
     onStartRace: () => startRace(baseSeed),
     onResume: () => {
       if (screenState === 'paused') togglePause();
@@ -113,6 +145,7 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
       audio.silenceLoops();
       sim = new RaceSimulation(baseSeed, isDemo);
       renderer3d.clearSkidsAndSmoke();
+      ui.setContextHint('');
       ui.setScreenState('title', isDemo);
     },
     onToggleCamera: toggleCamera,
@@ -123,8 +156,10 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
     },
     onToggleMute: toggleMute,
     onTogglePause: togglePause,
+    onSettingsChange: applySettingsToSubsystems,
   });
 
+  applySettingsToSubsystems(settings);
   ui.setScreenState(screenState, isDemo);
   ui.setCameraLabel(renderer3d.cameraMode);
   ui.setMutedLabel(audio.isMuted());
@@ -142,7 +177,11 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
     }
 
     if (screenState === 'title') {
-      if ((code === 'Enter' || code === 'Space') && !e.repeat) {
+      if (code === 'Escape' && ui.hasSubModalOpen()) {
+        ui.closeSubModals();
+        return;
+      }
+      if ((code === 'Enter' || code === 'Space') && !e.repeat && !ui.hasSubModalOpen()) {
         startRace(baseSeed);
       }
       return;
@@ -169,6 +208,11 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
       if (code === 'KeyM') {
         toggleMute();
       }
+      if (code === 'KeyL') {
+        settings.racingLine = !settings.racingLine;
+        applySettingsToSubsystems(settings);
+        ui.syncSettings(settings);
+      }
     }
 
     keysHeld.add(code);
@@ -180,6 +224,12 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
 
   const clearKeys = () => {
     keysHeld.clear();
+    ui.touchState.left = false;
+    ui.touchState.right = false;
+    ui.touchState.throttle = false;
+    ui.touchState.brake = false;
+    ui.touchState.handbrake = false;
+    ui.touchState.boost = false;
   };
 
   const onResize = () => {
@@ -195,25 +245,54 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
   document.addEventListener('visibilitychange', clearKeys);
 
   const readManualInput = (): ControlInput => {
-    const up = keysHeld.has('ArrowUp') || keysHeld.has('KeyW');
-    const down = keysHeld.has('ArrowDown') || keysHeld.has('KeyS');
-    const left = keysHeld.has('ArrowLeft') || keysHeld.has('KeyA');
-    const right = keysHeld.has('ArrowRight') || keysHeld.has('KeyD');
-    const handbrake = keysHeld.has('Space');
+    const t = ui.touchState;
+    const up = keysHeld.has('ArrowUp') || keysHeld.has('KeyW') || t.throttle;
+    const down = keysHeld.has('ArrowDown') || keysHeld.has('KeyS') || t.brake;
+    const left = keysHeld.has('ArrowLeft') || keysHeld.has('KeyA') || t.left;
+    const right = keysHeld.has('ArrowRight') || keysHeld.has('KeyD') || t.right;
+    const handbrake = keysHeld.has('Space') || t.handbrake;
+    const boost = keysHeld.has('ShiftLeft') || keysHeld.has('ShiftRight') || t.boost;
     return {
       throttle: up ? 1 : 0,
       brake: down ? 1 : 0,
       steer: (right ? 1 : 0) - (left ? 1 : 0),
       handbrake,
+      boost,
     };
+  };
+
+  const updateContextualHints = () => {
+    if (isDemo || sim.phase !== 'racing' || sim.cars[0].lapsCompleted >= 1) {
+      ui.setContextHint('');
+      return;
+    }
+    const player = sim.cars[0];
+    const smp = CIRCUIT.sampleAtS(player.s);
+    if (!shownBrakeHint && smp.brakingZone > 0.55) {
+      shownBrakeHint = true;
+      ui.setContextHint('Brake before the red racing line');
+      return;
+    }
+    if (!shownDriftHint && Math.abs(smp.curvature) > 0.01 && player.speedKmh > 75) {
+      shownDriftHint = true;
+      ui.setContextHint('Hold SPACE through the corner to drift');
+      return;
+    }
+    if (!shownNitroHint && player.boost >= 35 && Math.abs(smp.curvature) < 0.004 && sim.raceTime > 5) {
+      shownNitroHint = true;
+      ui.setContextHint('Press SHIFT to activate nitro boost');
+      return;
+    }
+    if (sim.raceTime > 24) {
+      ui.setContextHint('');
+    }
   };
 
   const tick = () => {
     if (disposed) return;
 
     const now = performance.now();
-    // Clamp frame dt to 0.05s on GPU, or allow steady steps up to 0.12s in software WebGL so demo progresses crisply
-    const maxStep = renderer3d.isSoftwareGl ? 0.12 : 0.05;
+    const maxStep = renderer3d.isSoftwareGl ? 0.25 : 0.05;
     const rawDt = Math.min(maxStep, Math.max(0.001, (now - lastTimestamp) / 1000));
     lastTimestamp = now;
 
@@ -221,7 +300,7 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
       accumulator += rawDt;
       const manualInput = isDemo ? undefined : readManualInput();
       let steps = 0;
-      while (accumulator >= FIXED_DT && steps < 10) {
+      while (accumulator >= FIXED_DT && steps < 16) {
         const prevPhase = sim.phase;
         sim.step(FIXED_DT, manualInput);
         accumulator -= FIXED_DT;
@@ -238,6 +317,16 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
           audio.playBeep(true);
         }
 
+        if (sim.events.length > 0) {
+          const priority = sim.events[0];
+          ui.pushEvent(priority);
+          if (priority.type === 'overtake' || priority.type === 'lap_record' || priority.type === 'drift_ok') {
+            audio.playChime(true);
+          } else if (priority.type === 'drift_fail') {
+            audio.playChime(false);
+          }
+        }
+
         if (sim.cars[0].lastImpactIntensity > 0.12) {
           audio.playImpact(sim.cars[0].lastImpactIntensity);
         }
@@ -247,6 +336,7 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
         goFlashTimer = Math.max(0, goFlashTimer - rawDt);
       }
 
+      updateContextualHints();
       renderer3d.updateGantryLights(sim.phase, sim.getCountdownDisplay());
       ui.updateHUD(
         sim.cars,
@@ -254,15 +344,21 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
         sim.phase,
         sim.getCountdownDisplay(),
         goFlashTimer,
-        sim.raceTime
+        sim.raceTime,
+        sim.getPlayerRaceProgress(),
+        rawDt
       );
 
       const player = sim.cars[0];
-      audio.update(player.speedKmh, player.throttle, player.driftIntensity, sim.phase === 'racing');
+      audio.update(player.speedKmh, player.throttle, player.driftIntensity, player.boosting, sim.phase === 'racing');
 
       if (sim.phase === 'finished') {
         screenState = 'gameover';
         audio.silenceLoops();
+        ui.setContextHint('');
+        if (sim.getPlayerPosition() <= 3) {
+          renderer3d.triggerPodiumConfetti();
+        }
         ui.showResults(sim.cars, sim.order, isDemo);
         ui.setScreenState('gameover', isDemo);
         demoRestartTimer = isDemo ? 4.5 : 0;
@@ -280,10 +376,9 @@ export function mountRacingGame(hostElement: HTMLElement): () => void {
     renderer3d.scheduleNextFrame(tick);
   };
 
-  // Start initial countdown sound if autostarting
   if (screenState === 'playing') {
     renderer3d.updateGantryLights(sim.phase, sim.getCountdownDisplay());
-    ui.updateHUD(sim.cars, sim.order, sim.phase, sim.getCountdownDisplay(), 0, 0);
+    ui.updateHUD(sim.cars, sim.order, sim.phase, sim.getCountdownDisplay(), 0, 0, 0, FIXED_DT);
   }
 
   renderer3d.syncAndRender(sim.cars, FIXED_DT, screenState);

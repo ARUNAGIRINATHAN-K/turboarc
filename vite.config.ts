@@ -25,6 +25,10 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
+          const racingHtml = path.resolve(__dirname, 'racing.html');
+          if (fs.existsSync(distDir) && fs.existsSync(racingHtml)) {
+            fs.copyFileSync(racingHtml, path.resolve(distDir, 'racing.html'));
+          }
         },
       },
     ],
